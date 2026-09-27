@@ -1,15 +1,15 @@
 //! HTML Report Generation from JSONL files for loki-util
-//! 
+//!
 //! Provides functionality to generate HTML reports from single or multiple JSONL files,
 //! reusing the existing HTML rendering pipeline from loki.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 // Duplicate types from helpers/html_report.rs since loki-util is a separate binary
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -83,26 +83,25 @@ pub struct ScanConfig {
 
 /// Parse JSONL file into ReportData
 pub fn parse_jsonl(path: &str) -> Result<ReportData, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
     let reader = BufReader::new(file);
-    
+
     let mut scan_start = None;
     let mut scan_end = None;
     let mut info_events = Vec::new();
     let mut findings = Vec::new();
-    
+
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
         if line.trim().is_empty() {
             continue;
         }
-        
+
         let event: LogEvent = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(_) => continue, // Skip malformed lines
         };
-        
+
         match event.event_type.as_str() {
             "scan_start" => scan_start = Some(event),
             "scan_end" => scan_end = Some(event),
@@ -111,14 +110,16 @@ pub fn parse_jsonl(path: &str) -> Result<ReportData, String> {
             _ => {}
         }
     }
-    
+
     // Sort findings by score descending
     findings.sort_by(|a, b| {
         let score_a = a.score.unwrap_or(0.0);
         let score_b = b.score.unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    
+
     Ok(ReportData {
         scan_start,
         scan_end,
@@ -157,7 +158,9 @@ pub struct CombinedReportData {
 
 /// Extract metadata from a parsed ReportData
 pub fn extract_metadata(data: &ReportData, filename: &str) -> SourceMetadata {
-    let hostname = data.scan_start.as_ref()
+    let hostname = data
+        .scan_start
+        .as_ref()
         .map(|e| e.hostname.clone())
         .unwrap_or_else(|| {
             // Try to extract from filename (loki_hostname_date.jsonl)
@@ -169,10 +172,10 @@ pub fn extract_metadata(data: &ReportData, filename: &str) -> SourceMetadata {
                 .map(|s: &str| s.to_string())
                 .unwrap_or_else(|| "Unknown".to_string())
         });
-    
+
     let scan_start = data.scan_start.as_ref().map(|e| e.timestamp);
     let scan_end = data.scan_end.as_ref().map(|e| e.timestamp);
-    
+
     // Calculate scan duration
     let scan_duration_seconds = scan_start.and_then(|start| {
         scan_end.map(|end| {
@@ -180,21 +183,22 @@ pub fn extract_metadata(data: &ReportData, filename: &str) -> SourceMetadata {
             duration.num_seconds() as f64 + duration.num_milliseconds() as f64 / 1000.0
         })
     });
-    
+
     // Extract version from scan_start message
-    let version = data.scan_start.as_ref()
-        .and_then(|e| {
-            let re = Regex::new(r"VERSION:\s*([^\s]+)").ok()?;
-            re.captures(&e.message)
-                .and_then(|caps| caps.get(1))
-                .map(|m| m.as_str().to_string())
-        });
-    
+    let version = data.scan_start.as_ref().and_then(|e| {
+        let re = Regex::new(r"VERSION:\s*([^\s]+)").ok()?;
+        re.captures(&e.message)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    });
+
     // Extract OS information from info events
-    let os_info = data.info_events.iter()
+    let os_info = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Operating system"))
         .map(|e| e.message.clone());
-    
+
     SourceMetadata {
         hostname,
         scan_start,
@@ -217,7 +221,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
     let mut cpu_limit = 100;
     let mut yara_rules_count = 0;
     let mut ioc_count = 0;
-    
+
     // Try to extract from info events
     for event in &data.info_events {
         // Extract thresholds from context
@@ -236,7 +240,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
                 notice_threshold = val;
             }
         }
-        
+
         // Extract max_file_size from "Scan limits" message
         if event.message.contains("MAX_FILE_SIZE") {
             if let Some(size_str) = event.context.get("MAX_FILE_SIZE") {
@@ -248,7 +252,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
                 }
             }
         }
-        
+
         // Extract thread count
         if event.message.contains("Thread pool") || event.message.contains("THREADS:") {
             let re = Regex::new(r"THREADS:\s*(\d+)").ok();
@@ -262,7 +266,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
                 }
             }
         }
-        
+
         // Extract CPU limit
         if event.message.contains("CPU") && event.message.contains("%") {
             let re = Regex::new(r"CPU[:\s]+(\d+)%").ok();
@@ -276,7 +280,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
                 }
             }
         }
-        
+
         // Extract YARA rules count
         if event.message.contains("YARA rules") || event.message.contains("rules loaded") {
             let re = Regex::new(r"(\d+)\s+rules").ok();
@@ -290,7 +294,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
                 }
             }
         }
-        
+
         // Extract IOC count
         if event.message.contains("IOC") || event.message.contains("indicators loaded") {
             let re = Regex::new(r"(\d+)\s+indicators").ok();
@@ -305,7 +309,7 @@ pub fn synthesize_scan_config(data: &ReportData) -> ScanConfig {
             }
         }
     }
-    
+
     ScanConfig {
         max_file_size,
         show_access_errors: false,
@@ -337,66 +341,74 @@ pub fn parse_multiple_jsonl_files(paths: &[String]) -> Result<CombinedReportData
     let mut version_statistics: BTreeMap<String, usize> = BTreeMap::new();
     let mut error_count_by_host: BTreeMap<String, usize> = BTreeMap::new();
     let mut total_findings = 0;
-    
+
     for path in paths {
         let report_data = parse_jsonl(path)?;
         let metadata = extract_metadata(&report_data, path);
-        
+
         // Count findings by severity
         for finding in &report_data.findings {
             let severity = finding.level.to_uppercase();
             *total_by_severity.entry(severity.clone()).or_insert(0) += 1;
-            
+
             // Count errors
             if severity == "ERROR" {
-                *error_count_by_host.entry(metadata.hostname.clone()).or_insert(0) += 1;
+                *error_count_by_host
+                    .entry(metadata.hostname.clone())
+                    .or_insert(0) += 1;
             }
         }
-        
+
         total_findings += report_data.findings.len();
-        
+
         // Store findings by source (use filename as key if hostname conflicts)
         let key = format!("{} ({})", metadata.hostname, metadata.filename);
         findings_by_source.insert(key.clone(), report_data.findings.clone());
-        
+
         // Store findings by hostname for filtering
         findings_by_hostname
             .entry(metadata.hostname.clone())
             .or_insert_with(Vec::new)
             .extend(report_data.findings.clone());
-        
+
         // Add all findings to merged list (will sort later)
         all_findings.extend(report_data.findings);
-        
+
         // Update OS statistics
         if let Some(ref os) = metadata.os_info {
             // Extract OS name from message (e.g., "Operating system information OS: linux ARCH: x86_64")
             let os_name = if let Some(os_part) = os.split("OS:").nth(1) {
-                os_part.split_whitespace().next().unwrap_or("unknown").to_string()
+                os_part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
             } else {
                 "unknown".to_string()
             };
             *os_statistics.entry(os_name).or_insert(0) += 1;
         }
-        
+
         // Update version statistics
         if let Some(ref ver) = metadata.version {
             *version_statistics.entry(ver.clone()).or_insert(0) += 1;
         }
-        
+
         // Update metadata with the key used
         let mut meta = metadata;
         meta.filename = key;
         sources.push(meta);
     }
-    
+
     // Sort all findings by score descending
     all_findings.sort_by(|a, b| {
         let score_a = a.score.unwrap_or(0.0);
         let score_b = b.score.unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    
+
     Ok(CombinedReportData {
         sources,
         findings_by_source,
@@ -412,7 +424,8 @@ pub fn parse_multiple_jsonl_files(paths: &[String]) -> Result<CombinedReportData
 
 /// Extract version from scan_start message or use binary version
 pub fn extract_version(data: &ReportData, fallback_version: &str) -> String {
-    data.scan_start.as_ref()
+    data.scan_start
+        .as_ref()
         .and_then(|e| {
             let re = Regex::new(r"VERSION:\s*([^\s]+)").ok()?;
             re.captures(&e.message)
@@ -431,41 +444,54 @@ pub fn generate_single_report(
 ) -> Result<String, String> {
     // Parse JSONL
     let report_data = parse_jsonl(input_path)?;
-    
+
     // Extract metadata
     let metadata = extract_metadata(&report_data, input_path);
     let _hostname = host_override.unwrap_or(&metadata.hostname).to_string();
     let version = extract_version(&report_data, LOKI_UTIL_VERSION);
-    
+
     // Synthesize scan config
     let scan_config = synthesize_scan_config(&report_data);
-    
+
     // Determine output path
-    let html_path = output_path.unwrap_or_else(|| {
-        // Default: same as input but with .html extension
-        if input_path.ends_with(".jsonl") {
-            &input_path[..input_path.len() - 6]
+    let html_path = if let Some(output) = output_path {
+        if output.ends_with(".html") {
+            output.to_string()
         } else {
-            input_path
+            format!("{}.html", output)
         }
-    });
-    let html_path = if html_path.ends_with(".html") {
-        html_path.to_string()
     } else {
-        format!("{}.html", html_path)
+        report_output_path(Path::new(input_path))
+            .to_string_lossy()
+            .into_owned()
     };
-    
+
+    if Path::new(input_path) == Path::new(&html_path)
+        || matches!(
+            (std::fs::canonicalize(input_path), std::fs::canonicalize(&html_path)),
+            (Ok(input), Ok(output)) if input == output
+        )
+    {
+        return Err("HTML output path must differ from the JSONL input path".to_string());
+    }
+
     // Generate HTML using simplified renderer
     // Note: For full feature parity, we'd need to import render_html from helpers/html_report.rs
     // For now, we use a simplified version that produces similar output
-    let html_content = render_html_simplified(&report_data, &scan_config, &version, input_path, title_override);
-    
+    let html_content = render_html_simplified(
+        &report_data,
+        &scan_config,
+        &version,
+        input_path,
+        title_override,
+    );
+
     // Write HTML file
-    let mut file = File::create(&html_path)
-        .map_err(|e| format!("Failed to create HTML file: {}", e))?;
+    let mut file =
+        File::create(&html_path).map_err(|e| format!("Failed to create HTML file: {}", e))?;
     file.write_all(html_content.as_bytes())
         .map_err(|e| format!("Failed to write HTML file: {}", e))?;
-    
+
     Ok(html_path)
 }
 
@@ -476,9 +502,11 @@ pub fn render_combined_html(
     output_path: &str,
 ) -> Result<String, String> {
     let mut html = String::new();
-    
+
     // Calculate scan duration range
-    let scan_durations: Vec<f64> = data.sources.iter()
+    let scan_durations: Vec<f64> = data
+        .sources
+        .iter()
         .filter_map(|s| s.scan_duration_seconds)
         .collect();
     let min_duration = scan_durations.iter().fold(f64::INFINITY, |a, &b| a.min(b));
@@ -488,9 +516,11 @@ pub fn render_combined_html(
     } else {
         0.0
     };
-    
+
     // Build OS distribution string
-    let os_distribution: Vec<String> = data.os_statistics.iter()
+    let os_distribution: Vec<String> = data
+        .os_statistics
+        .iter()
         .map(|(os, count)| format!("{}x {}", count, os))
         .collect();
     let os_dist_str = if os_distribution.is_empty() {
@@ -498,9 +528,11 @@ pub fn render_combined_html(
     } else {
         os_distribution.join(", ")
     };
-    
+
     // Build version distribution string
-    let version_distribution: Vec<String> = data.version_statistics.iter()
+    let version_distribution: Vec<String> = data
+        .version_statistics
+        .iter()
         .map(|(ver, count)| format!("{}x v{}", count, ver))
         .collect();
     let version_dist_str = if version_distribution.is_empty() {
@@ -508,25 +540,45 @@ pub fn render_combined_html(
     } else {
         version_distribution.join(", ")
     };
-    
+
     // Build statistics table data
     let mut stats_rows = Vec::new();
     for source in &data.sources {
-        let findings = data.findings_by_hostname.get(&source.hostname).map(|v| v.as_slice()).unwrap_or(&[]);
-        let alerts = findings.iter().filter(|f| f.level.to_uppercase() == "ALERT").count();
-        let warnings = findings.iter().filter(|f| f.level.to_uppercase() == "WARNING").count();
-        let notices = findings.iter().filter(|f| f.level.to_uppercase() == "NOTICE").count();
-        let errors = data.error_count_by_host.get(&source.hostname).copied().unwrap_or(0);
-        
+        let findings = data
+            .findings_by_hostname
+            .get(&source.hostname)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let alerts = findings
+            .iter()
+            .filter(|f| f.level.to_uppercase() == "ALERT")
+            .count();
+        let warnings = findings
+            .iter()
+            .filter(|f| f.level.to_uppercase() == "WARNING")
+            .count();
+        let notices = findings
+            .iter()
+            .filter(|f| f.level.to_uppercase() == "NOTICE")
+            .count();
+        let errors = data
+            .error_count_by_host
+            .get(&source.hostname)
+            .copied()
+            .unwrap_or(0);
+
         stats_rows.push((source.hostname.clone(), alerts, warnings, notices, errors));
     }
-    
+
     html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
     html.push_str("    <meta charset=\"UTF-8\">\n");
-    html.push_str("    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+    html.push_str(
+        "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n",
+    );
     html.push_str("    <title>Loki-RS Combined Scan Report</title>\n");
     html.push_str("    <style>\n");
-    html.push_str(r##"        :root {
+    html.push_str(
+        r##"        :root {
             --bg-primary: #0d1117;
             --bg-secondary: #161b22;
             --bg-tertiary: #1f2428;
@@ -871,41 +923,51 @@ pub fn render_combined_html(
             color: #fff;
             border-color: var(--alert-bg);
         }
-    "##);
+    "##,
+    );
     html.push_str("    </style>\n");
     html.push_str("</head>\n<body>\n");
-    
+
     // Header
     html.push_str("    <div class=\"header\">\n");
     html.push_str("        <h1>Loki-RS Combined Scan Report</h1>\n");
-    html.push_str(&format!("        <p>Generated: {} | Total Hosts: {} | Total Findings: {}</p>\n",
+    html.push_str(&format!(
+        "        <p>Generated: {} | Total Hosts: {} | Total Findings: {}</p>\n",
         Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
         data.sources.len(),
         data.total_findings
     ));
     html.push_str("    </div>\n");
-    
+
     // Summary statistics
     html.push_str("    <div class=\"summary-stats\">\n");
     html.push_str("        <div class=\"stat-card\">\n");
     html.push_str("            <h3>Operating Systems</h3>\n");
-    html.push_str(&format!("            <p>{}</p>\n", html_escape(&os_dist_str)));
+    html.push_str(&format!(
+        "            <p>{}</p>\n",
+        html_escape(&os_dist_str)
+    ));
     html.push_str("        </div>\n");
     html.push_str("        <div class=\"stat-card\">\n");
     html.push_str("            <h3>Loki Versions</h3>\n");
-    html.push_str(&format!("            <p>{}</p>\n", html_escape(&version_dist_str)));
+    html.push_str(&format!(
+        "            <p>{}</p>\n",
+        html_escape(&version_dist_str)
+    ));
     html.push_str("        </div>\n");
     html.push_str("        <div class=\"stat-card\">\n");
     html.push_str("            <h3>Scan Duration</h3>\n");
     if min_duration != f64::INFINITY {
-        html.push_str(&format!("            <p>Range: {:.1}s - {:.1}s<br>Avg: {:.1}s</p>\n",
-            min_duration, max_duration, avg_duration));
+        html.push_str(&format!(
+            "            <p>Range: {:.1}s - {:.1}s<br>Avg: {:.1}s</p>\n",
+            min_duration, max_duration, avg_duration
+        ));
     } else {
         html.push_str("            <p>N/A</p>\n");
     }
     html.push_str("        </div>\n");
     html.push_str("    </div>\n");
-    
+
     // Filter Panel
     html.push_str("    <div class=\"filter-panel\" id=\"filterPanel\">\n");
     html.push_str("        <div class=\"filter-panel-header\" onclick=\"toggleFilterPanel()\">\n");
@@ -926,7 +988,7 @@ pub fn render_combined_html(
     html.push_str("        </div>\n");
     html.push_str("    </div>\n");
     html.push_str("    <input type=\"file\" id=\"importInput\" class=\"hidden-input\" accept=\".json\" onchange=\"importFilters(event)\">\n");
-    
+
     // Interactive statistics table
     html.push_str("    <div class=\"stats-table-container\">\n");
     html.push_str("        <h2>Host Statistics</h2>\n");
@@ -945,27 +1007,28 @@ pub fn render_combined_html(
     html.push_str("                </tr>\n");
     html.push_str("            </thead>\n");
     html.push_str("            <tbody>\n");
-    
+
     for (hostname, alerts, warnings, notices, errors) in &stats_rows {
         let hostname_escaped = html_escape(hostname);
+        let hostname_js = js_html_attribute_escape(hostname);
         html.push_str(&format!(
             "                <tr>\n                    <td class=\"clickable-cell\" onclick=\"filterByHostname('{}')\" data-hostname=\"{}\">{}</td>\n                    <td class=\"clickable-cell\" onclick=\"filterByHostnameAndSeverity('{}', 'ALERT')\" data-hostname=\"{}\" data-severity=\"ALERT\">{}</td>\n                    <td class=\"clickable-cell\" onclick=\"filterByHostnameAndSeverity('{}', 'WARNING')\" data-hostname=\"{}\" data-severity=\"WARNING\">{}</td>\n                    <td class=\"clickable-cell\" onclick=\"filterByHostnameAndSeverity('{}', 'NOTICE')\" data-hostname=\"{}\" data-severity=\"NOTICE\">{}</td>\n                    <td class=\"clickable-cell\" onclick=\"filterByHostnameAndSeverity('{}', 'ERROR')\" data-hostname=\"{}\" data-severity=\"ERROR\">{}</td>\n                </tr>\n",
-            hostname_escaped, hostname_escaped, hostname_escaped,
-            hostname_escaped, hostname_escaped, alerts,
-            hostname_escaped, hostname_escaped, warnings,
-            hostname_escaped, hostname_escaped, notices,
-            hostname_escaped, hostname_escaped, errors
+            hostname_js, hostname_escaped, hostname_escaped,
+            hostname_js, hostname_escaped, alerts,
+            hostname_js, hostname_escaped, warnings,
+            hostname_js, hostname_escaped, notices,
+            hostname_js, hostname_escaped, errors
         ));
     }
-    
+
     html.push_str("            </tbody>\n");
     html.push_str("        </table>\n");
     html.push_str("    </div>\n");
-    
+
     // Merged findings list
     html.push_str("    <div class=\"findings-section\">\n");
     html.push_str("        <h2>All Findings (Sorted by Score)</h2>\n");
-    
+
     if data.all_findings.is_empty() {
         html.push_str("        <div class=\"no-findings\">\n");
         html.push_str("            <h3>✓ No Findings</h3>\n");
@@ -976,9 +1039,9 @@ pub fn render_combined_html(
             html.push_str(&render_finding_with_hostname(finding));
         }
     }
-    
+
     html.push_str("    </div>\n");
-    
+
     // Context Menu
     html.push_str("    <!-- Context Menu -->\n");
     html.push_str("    <div class=\"context-menu\" id=\"contextMenu\">\n");
@@ -991,7 +1054,7 @@ pub fn render_combined_html(
     html.push_str("            <span>Search on Google</span>\n");
     html.push_str("        </div>\n");
     html.push_str("    </div>\n");
-    
+
     // JavaScript for filtering
     html.push_str("    <script>\n");
     html.push_str(r##"        // =====================================================
@@ -1344,7 +1407,7 @@ pub fn render_combined_html(
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
-            return div.innerHTML;
+            return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
         
         function truncateText(text, maxLen) {
@@ -1358,27 +1421,29 @@ pub fn render_combined_html(
     "##);
     html.push_str("    </script>\n");
     html.push_str("</body>\n</html>\n");
-    
+
     // Write HTML file
-    let mut file = File::create(output_path)
-        .map_err(|e| format!("Failed to create HTML file: {}", e))?;
+    let mut file =
+        File::create(output_path).map_err(|e| format!("Failed to create HTML file: {}", e))?;
     file.write_all(html.as_bytes())
         .map_err(|e| format!("Failed to write HTML file: {}", e))?;
-    
+
     Ok(output_path.to_string())
 }
 
 /// Simple finding renderer for combined reports (kept for backward compatibility)
 #[allow(dead_code)]
 fn render_finding_simple(finding: &LogEvent, severity_class: &str) -> String {
-    let path_or_name = finding.file_path.as_deref()
+    let path_or_name = finding
+        .file_path
+        .as_deref()
         .or(finding.process_name.as_deref())
         .unwrap_or("Unknown");
     let score = finding.score.unwrap_or(0.0).round() as i16;
-    
+
     format!(
         "        <div class=\"finding {}\">\n            <strong>{}</strong> (Score: {})<br>\n            Path: {}<br>\n        </div>\n",
-        severity_class, finding.level, score, path_or_name
+        html_escape(severity_class), html_escape(&finding.level), score, html_escape(path_or_name)
     )
 }
 
@@ -1391,72 +1456,81 @@ fn render_finding_with_hostname(finding: &LogEvent) -> String {
         "ERROR" => "error",
         _ => "notice",
     };
-    
+
     let hostname = &finding.hostname;
     let hostname_escaped = html_escape(hostname);
     let score = finding.score.unwrap_or(0.0).round() as i16;
-    let path_or_name = finding.file_path.as_deref()
+    let path_or_name = finding
+        .file_path
+        .as_deref()
         .or(finding.process_name.as_deref())
         .unwrap_or("Unknown");
     let path_escaped = html_escape(path_or_name);
-    
-    // Escape hostname for JavaScript
-    let hostname_js = hostname.replace('\\', "\\\\").replace('\'', "\\'");
-    
+
     let mut details_html = String::new();
-    
+
     if let Some(size) = finding.file_size {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">Size:</span> <span class="detail-value">{}</span></div>"#,
             format_size(size as usize)
         ));
     }
-    
+
     if let Some(ref md5) = finding.md5 {
-        let md5_js = md5.replace('\\', "\\\\").replace('\'', "\\'");
+        let md5_js = js_html_attribute_escape(md5);
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">MD5:</span> <span class="detail-value">{}<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this hash">✖</button></span></div>"#,
             html_escape(md5), md5_js
         ));
     }
-    
+
     if let Some(ref sha1) = finding.sha1 {
-        let sha1_js = sha1.replace('\\', "\\\\").replace('\'', "\\'");
+        let sha1_js = js_html_attribute_escape(sha1);
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">SHA1:</span> <span class="detail-value">{}<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this hash">✖</button></span></div>"#,
             html_escape(sha1), sha1_js
         ));
     }
-    
+
     if let Some(ref sha256) = finding.sha256 {
-        let sha256_js = sha256.replace('\\', "\\\\").replace('\'', "\\'");
+        let sha256_js = js_html_attribute_escape(sha256);
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">SHA256:</span> <span class="detail-value">{}<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this hash">✖</button></span></div>"#,
             html_escape(sha256), sha256_js
         ));
     }
-    
+
     let reasons_html = if let Some(ref reasons) = finding.reasons {
-        let mut reasons_str = String::from(r#"<div class="reasons-section"><h4>Match Reasons</h4>"#);
+        let mut reasons_str =
+            String::from(r#"<div class="reasons-section"><h4>Match Reasons</h4>"#);
         for reason in reasons {
             // Extract rule name if it's a YARA match
-            let rule_name = if reason.message.starts_with("YARA match with rule ") || reason.message.starts_with("YARA-X match with rule ") {
+            let rule_name = if reason.message.starts_with("YARA match with rule ")
+                || reason.message.starts_with("YARA-X match with rule ")
+            {
                 reason.message.split(" rule ").nth(1).map(|s| s.to_string())
             } else {
                 None
             };
-            
+
             let filter_btn = if let Some(ref rn) = rule_name {
-                let rule_js = rn.replace('\\', "\\\\").replace('\'', "\\'");
-                format!(r#"<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this rule">✖</button>"#, rule_js)
+                let rule_js = js_html_attribute_escape(rn);
+                format!(
+                    r#"<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this rule">✖</button>"#,
+                    rule_js
+                )
             } else {
                 String::new()
             };
-            
+
             reasons_str.push_str(&format!(
                 r#"<div class="reason-item"><strong>{}:</strong> {} (Score: {}){}</div>"#,
                 html_escape(&reason.message),
-                reason.description.as_ref().map(|d| html_escape(d)).unwrap_or_default(),
+                reason
+                    .description
+                    .as_ref()
+                    .map(|d| html_escape(d))
+                    .unwrap_or_default(),
                 reason.score,
                 filter_btn
             ));
@@ -1466,10 +1540,9 @@ fn render_finding_with_hostname(finding: &LogEvent) -> String {
     } else {
         String::new()
     };
-    
-    // Escape path for JavaScript
-    let path_js = path_or_name.replace('\\', "\\\\").replace('\'', "\\'");
-    
+
+    let path_js = js_html_attribute_escape(path_or_name);
+
     format!(
         r#"        <div class="finding-card {}" data-hostname="{}" data-severity="{}" data-score="{}">
             <div class="finding-header">
@@ -1484,8 +1557,8 @@ fn render_finding_with_hostname(finding: &LogEvent) -> String {
         </div>
 "#,
         level_class,
-        hostname_js,
-        level,
+        hostname_escaped,
+        html_escape(&level),
         score,
         html_escape(&level),
         hostname_escaped,
@@ -1499,6 +1572,90 @@ fn render_finding_with_hostname(finding: &LogEvent) -> String {
 
 const LOKI_UTIL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "loki-util-report-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn test_report_filter_attribute_encoding() {
+        assert_eq!(
+            js_html_attribute_escape("\\'\"<&\n\r\u{2028}\u{2029}"),
+            "\\\\\\&#39;&quot;&lt;&amp;\\n\\r\\u2028\\u2029"
+        );
+        let payload = "\"><img src=x onerror=alert(1)>&quot;');alert(2);//\\\n\r";
+        let finding: LogEvent = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-06-18T09:09:29Z",
+            "level": "ALERT",
+            "event_type": "file_match",
+            "hostname": payload,
+            "message": "File Match",
+            "file_path": payload,
+            "md5": payload,
+            "sha1": payload,
+            "sha256": payload,
+            "reasons": [{"message": format!("YARA match with rule {}", payload), "score": 100}]
+        }))
+        .unwrap();
+        let html = render_finding_with_hostname(&finding);
+        let handler = "onclick=\"filterValue('&quot;&gt;&lt;img src=x onerror=alert(1)&gt;&amp;quot;\\&#39;);alert(2);//\\\\\\n\\r', event)\"";
+        assert_eq!(html.matches(handler).count(), 5);
+        assert!(html.contains(&format!("data-hostname=\"{}\"", html_escape(payload))));
+        assert!(!html.contains("<img"));
+
+        let directory = temp_directory();
+        let input = directory.join("scan.jsonl");
+        let mut start = finding.clone();
+        start.event_type = "scan_start".to_string();
+        std::fs::write(
+            &input,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&start).unwrap(),
+                serde_json::to_string(&finding).unwrap()
+            ),
+        )
+        .unwrap();
+        let data = parse_multiple_jsonl_files(&[input.to_string_lossy().into_owned()]).unwrap();
+        let output = directory.join("combined.html");
+        render_combined_html(&data, "test", output.to_str().unwrap()).unwrap();
+        let html = std::fs::read_to_string(output).unwrap();
+        assert!(html.contains("onclick=\"filterByHostname('&quot;&gt;&lt;img src=x onerror=alert(1)&gt;&amp;quot;\\&#39;);alert(2);//\\\\\\n\\r')\""));
+        assert!(!html.contains("<img"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn test_single_report_preserves_html_named_input() {
+        let directory = temp_directory();
+        let input = directory.join("scan.html");
+        let jsonl = "{\"timestamp\":\"2026-06-18T09:09:29Z\",\"level\":\"INFO\",\"event_type\":\"scan_start\",\"hostname\":\"host\",\"message\":\"Scan started\"}\n";
+        std::fs::write(&input, jsonl).unwrap();
+        let input = input.to_str().unwrap();
+        let output = generate_single_report(input, None, None, None).unwrap();
+        assert_eq!(Path::new(&output), directory.join("scan.html.html"));
+        assert_eq!(std::fs::read_to_string(input).unwrap(), jsonl);
+        assert!(std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("<!DOCTYPE html>"));
+        assert!(generate_single_report(input, Some(input), None, None).is_err());
+        assert_eq!(std::fs::read_to_string(input).unwrap(), jsonl);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 // Helper functions for HTML rendering (copied from helpers/html_report.rs to maintain consistency)
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -1508,11 +1665,37 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Escape a single-quoted JavaScript string inside a double-quoted HTML attribute.
+fn js_html_attribute_escape(s: &str) -> String {
+    html_escape(
+        &s.replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029"),
+    )
+}
+
+fn report_output_path(input: &Path) -> PathBuf {
+    if input
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("html"))
+    {
+        let mut output = input.as_os_str().to_os_string();
+        output.push(".html");
+        PathBuf::from(output)
+    } else {
+        input.with_extension("html")
+    }
+}
+
 fn format_size(bytes: usize) -> String {
     const KB: usize = 1_000;
     const MB: usize = KB * 1_000;
     const GB: usize = MB * 1_000;
-    
+
     if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
@@ -1550,46 +1733,69 @@ fn render_html_simplified(
     jsonl_path: &str,
     title_override: Option<&str>,
 ) -> String {
-    let hostname = data.scan_start.as_ref()
+    let hostname = data
+        .scan_start
+        .as_ref()
         .map(|e| e.hostname.clone())
         .unwrap_or_else(|| "Unknown".to_string());
-    
+
     let default_title = format!("Loki-RS Scan Report - {}", hostname);
     let title = title_override.unwrap_or(&default_title);
-    
-    let scan_start_time = data.scan_start.as_ref()
+
+    let scan_start_time = data
+        .scan_start
+        .as_ref()
         .map(|e| e.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "Unknown".to_string());
-    
-    let scan_end_time = data.scan_end.as_ref()
+
+    let scan_end_time = data
+        .scan_end
+        .as_ref()
         .map(|e| e.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "Unknown".to_string());
-    
+
     // Extract metadata from info events (not used in simplified version but kept for future use)
-    let _cmd_flags = data.info_events.iter()
+    let _cmd_flags = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Command line flags"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
-    let _os_info = data.info_events.iter()
+
+    let _os_info = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Operating system"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
+
     // Count findings by level
-    let alert_count = data.findings.iter().filter(|f| f.level.to_uppercase() == "ALERT").count();
-    let warning_count = data.findings.iter().filter(|f| f.level.to_uppercase() == "WARNING").count();
-    let notice_count = data.findings.iter().filter(|f| f.level.to_uppercase() == "NOTICE").count();
-    
+    let alert_count = data
+        .findings
+        .iter()
+        .filter(|f| f.level.to_uppercase() == "ALERT")
+        .count();
+    let warning_count = data
+        .findings
+        .iter()
+        .filter(|f| f.level.to_uppercase() == "WARNING")
+        .count();
+    let notice_count = data
+        .findings
+        .iter()
+        .filter(|f| f.level.to_uppercase() == "NOTICE")
+        .count();
+
     let jsonl_filename = Path::new(jsonl_path)
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| jsonl_path.to_string());
-    
+
     let findings_html = render_findings_simplified(&data.findings);
-    
+
     // Generate simplified HTML (matching the structure of the full version)
-    format!(r##"<!DOCTYPE html>
+    format!(
+        r##"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1803,9 +2009,10 @@ fn render_findings_simplified(findings: &[LogEvent]) -> String {
         return r#"<div class="no-findings">
             <h2>✓ No Findings</h2>
             <p>The scan completed without detecting any threats above the configured thresholds.</p>
-        </div>"#.to_string();
+        </div>"#
+            .to_string();
     }
-    
+
     let mut html = String::new();
     for (idx, finding) in findings.iter().enumerate() {
         html.push_str(&render_finding_card_simplified(finding, idx));
@@ -1820,49 +2027,56 @@ fn render_finding_card_simplified(finding: &LogEvent, _idx: usize) -> String {
         "warning" => "warning",
         _ => "notice",
     };
-    
+
     let score = finding.score.unwrap_or(0.0).round() as i16;
-    let path_or_name = finding.file_path.as_deref()
+    let path_or_name = finding
+        .file_path
+        .as_deref()
         .or(finding.process_name.as_deref())
         .unwrap_or("Unknown");
-    
+
     let mut details_html = String::new();
-    
+
     if let Some(size) = finding.file_size {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">Size:</span> <span class="detail-value">{}</span></div>"#,
             format_size(size as usize)
         ));
     }
-    
+
     if let Some(ref md5) = finding.md5 {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">MD5:</span> <span class="detail-value">{}</span></div>"#,
             html_escape(md5)
         ));
     }
-    
+
     if let Some(ref sha1) = finding.sha1 {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">SHA1:</span> <span class="detail-value">{}</span></div>"#,
             html_escape(sha1)
         ));
     }
-    
+
     if let Some(ref sha256) = finding.sha256 {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">SHA256:</span> <span class="detail-value">{}</span></div>"#,
             html_escape(sha256)
         ));
     }
-    
+
     let reasons_html = if let Some(ref reasons) = finding.reasons {
-        let mut reasons_str = String::from(r#"<div class="reasons-section"><h4>Match Reasons</h4>"#);
+        let mut reasons_str =
+            String::from(r#"<div class="reasons-section"><h4>Match Reasons</h4>"#);
         for reason in reasons {
             reasons_str.push_str(&format!(
                 r#"<div class="reason-item"><strong>{}:</strong> {} (Score: {})</div>"#,
                 html_escape(&reason.message),
-                reason.description.as_ref().map(|d| html_escape(d)).unwrap_or_default(),
+                reason
+                    .description
+                    .as_ref()
+                    .map(|d| html_escape(d))
+                    .unwrap_or_default(),
                 reason.score
             ));
         }
@@ -1871,7 +2085,7 @@ fn render_finding_card_simplified(finding: &LogEvent, _idx: usize) -> String {
     } else {
         String::new()
     };
-    
+
     format!(
         r#"<div class="finding {}">
             <div class="finding-header">

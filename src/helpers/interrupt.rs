@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use dashmap::DashMap;
-use std::io::{self, Write};
 use colored::Colorize;
+use dashmap::DashMap;
 use rayon::current_thread_index;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 pub struct ScanState {
     pub current_elements: DashMap<usize, String>,
@@ -63,7 +63,7 @@ impl ScanState {
     pub fn increment_files(&self) {
         self.files_scanned.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     pub fn increment_processes(&self) {
         self.processes_scanned.fetch_add(1, Ordering::Relaxed);
     }
@@ -93,8 +93,9 @@ impl ScanState {
     }
 
     pub fn wait_for_resume(&self) {
-        while (self.menu_active.load(Ordering::Relaxed) || self.is_paused.load(Ordering::Relaxed)) 
-              && !self.should_exit.load(Ordering::Relaxed) {
+        while (self.menu_active.load(Ordering::Relaxed) || self.is_paused.load(Ordering::Relaxed))
+            && !self.should_exit.load(Ordering::Relaxed)
+        {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -164,7 +165,7 @@ impl ScanState {
         let bytes = s.as_bytes();
         let len = bytes.len();
         let mut result = String::with_capacity(len + (len - 1) / 3);
-        
+
         for (i, b) in bytes.iter().enumerate() {
             result.push(*b as char);
             if (len - i - 1) % 3 == 0 && i != len - 1 {
@@ -179,24 +180,24 @@ impl ScanState {
         if char_count <= max_len {
             return s.to_string();
         }
-        
+
         let keep_len = (max_len.saturating_sub(3)) / 2;
         if keep_len == 0 {
             return "...".to_string();
         }
         let start: String = s.chars().take(keep_len).collect();
         let end: String = s.chars().skip(char_count - keep_len).collect();
-        
+
         format!("{}...{}", start, end)
     }
 
     pub fn display_menu(&self) {
         // Set menu active to pause output from other threads if possible
         self.menu_active.store(true, Ordering::SeqCst);
-        
+
         // Clear line to prevent mess
         print!("\r");
-        
+
         let duration = self.start_time.elapsed();
         let files = self.files_scanned.load(Ordering::Relaxed);
         let procs = self.processes_scanned.load(Ordering::Relaxed);
@@ -204,48 +205,82 @@ impl ScanState {
         let warnings = self.warnings.load(Ordering::Relaxed);
         let notices = self.notices.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
-        
-        println!("{}", "                                                        ");
-        println!("{}", "                                                        ".on_green());
-        println!("{}", "                  LOKI INTERRUPT MENU                   ".black().on_green().bold());
-        println!("{}", "                                                        ".on_green());
-        
+
+        println!(
+            "{}",
+            "                                                        "
+        );
+        println!(
+            "{}",
+            "                                                        ".on_green()
+        );
+        println!(
+            "{}",
+            "                  LOKI INTERRUPT MENU                   "
+                .black()
+                .on_green()
+                .bold()
+        );
+        println!(
+            "{}",
+            "                                                        ".on_green()
+        );
+
         println!("\nSCAN STATISTICS:");
-        println!("  Duration:          {:02}:{:02}:{:02}", 
+        println!(
+            "  Duration:          {:02}:{:02}:{:02}",
             duration.as_secs() / 3600,
             (duration.as_secs() % 3600) / 60,
-            duration.as_secs() % 60);
+            duration.as_secs() % 60
+        );
         println!("  Files scanned:     {}", Self::format_number(files));
         println!("  Processes scanned: {}", Self::format_number(procs));
-        println!("  Alerts:            {}", Self::format_number(alerts).red().bold());
-        println!("  Warnings:          {}", Self::format_number(warnings).yellow().bold());
-        println!("  Notices:           {}", Self::format_number(notices).cyan());
-        println!("  Errors:            {}", Self::format_number(errors).purple());
-        
-        println!("\nCURRENTLY SCANNING ({} threads active):", self.current_elements.len());
-        
+        println!(
+            "  Alerts:            {}",
+            Self::format_number(alerts).red().bold()
+        );
+        println!(
+            "  Warnings:          {}",
+            Self::format_number(warnings).yellow().bold()
+        );
+        println!(
+            "  Notices:           {}",
+            Self::format_number(notices).cyan()
+        );
+        println!(
+            "  Errors:            {}",
+            Self::format_number(errors).purple()
+        );
+
+        println!(
+            "\nCURRENTLY SCANNING ({} threads active):",
+            self.current_elements.len()
+        );
+
         // Collect and sort entries by thread ID for consistent display
-        let mut entries: Vec<_> = self.current_elements.iter()
+        let mut entries: Vec<_> = self
+            .current_elements
+            .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect();
         entries.sort_by_key(|k| k.0);
-        
+
         if entries.is_empty() {
-             println!("  (No active scans)");
+            println!("  (No active scans)");
         } else {
             for (thread_id, element) in entries {
                 let display_element = Self::truncate_middle(&element, 75);
                 println!("  [{}] {}", thread_id, display_element);
             }
         }
-        
+
         println!("\n{}", "-".repeat(60).bright_black());
         println!("  [E] Exit gracefully    [X] Exit immediately    [C] Continue scan");
         println!("{}", "-".repeat(60).bright_black());
-        
+
         print!("> ");
         io::stdout().flush().unwrap();
-        
+
         // Simple input loop
         loop {
             let mut input = String::new();
@@ -257,21 +292,21 @@ impl ScanState {
                             println!("Exiting gracefully... (please wait)");
                             self.should_exit.store(true, Ordering::SeqCst);
                             break;
-                        },
+                        }
                         "X" | "KILL" | "QUIT" => {
                             println!("Exiting immediately...");
                             std::process::exit(0);
-                        },
+                        }
                         "C" | "CONTINUE" => {
                             println!("Resuming scan...");
                             break;
-                        },
+                        }
                         _ => {
                             print!("Invalid option. [E]xit, [X] immediate or [C]ontinue > ");
                             io::stdout().flush().unwrap();
                         }
                     }
-                },
+                }
                 Err(_) => {
                     // If reading stdin fails, default to exit
                     self.should_exit.store(true, Ordering::SeqCst);
@@ -279,7 +314,7 @@ impl ScanState {
                 }
             }
         }
-        
+
         self.menu_active.store(false, Ordering::SeqCst);
     }
 }

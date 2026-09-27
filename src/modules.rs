@@ -1,12 +1,12 @@
-pub mod process_check;
 pub mod filesystem_scan;
+pub mod process_check;
 
-use regex::Regex;
-use yara_x::Rules;
-use std::sync::Arc;
-use crate::{ScanConfig, HashIOCCollections, FalsePositiveHashCollections, FilenameIOC, C2IOC};
-use crate::helpers::unified_logger::UnifiedLogger;
 use crate::helpers::interrupt::ScanState;
+use crate::helpers::unified_logger::UnifiedLogger;
+use crate::{FalsePositiveHashCollections, FilenameIOC, HashIOCCollections, ScanConfig, C2IOC};
+use regex::Regex;
+use std::sync::Arc;
+use yara_x::Rules;
 
 pub struct ScanContext<'a> {
     pub compiled_rules: &'a Rules,

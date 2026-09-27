@@ -166,9 +166,10 @@ test_combined_report() {
         return 1
     fi
     
-    # Check for summary table
-    if ! grep -q "Summary" "$output"; then
-        echo "FAIL: HTML missing summary section"
+    # Verify the rendered summary and its totals, independent of heading wording.
+    if ! grep -Fq 'class="summary-stats"' "$output" || \
+       ! grep -Fq 'Total Hosts: 2 | Total Findings: 4' "$output"; then
+        echo "FAIL: HTML missing combined summary or expected totals"
         return 1
     fi
     

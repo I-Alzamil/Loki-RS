@@ -33,6 +33,7 @@ Loki-RS - High-Performance, Multi-threaded YARA & IOC Scanner
 
 Options:
   -m, --max-file-size         Maximum file size to scan (default: 10000000)
+      --yara-timeout          YARA scan timeout per file/process in seconds (default: 10)
   -s, --show-access-errors    Show all file and process access errors
   -c, --scan-all-files        Scan all files regardless of their file type / extension
   -d, --debug                 Show debugging information
@@ -53,6 +54,11 @@ Options:
 ### Scan a specific directory:
 ```bash
 ./build/loki -f /path/to/scan
+```
+
+### Scan a Windows directory with spaces:
+```powershell
+.\loki.exe -f "J:\SteamLibrary\steamapps\common\SpaceCraft beta"
 ```
 
 ### Scan with debug output:
@@ -214,6 +220,7 @@ Loki-RS supports multiple log levels:
 ### Process scanning fails
 - Process memory scanning requires appropriate permissions
 - Some processes may be protected
+- On Linux, device-backed and kernel-special mappings are skipped intentionally to avoid unstable driver VMAs
 - On macOS, most processes deny memory access unless debugging entitlements or elevated privileges are present
 - Use `-n` to skip process scanning if needed
 
@@ -224,4 +231,3 @@ See `README.md` for detailed build instructions and requirements.
 ## License
 
 See `LICENSE` file for license information.
-

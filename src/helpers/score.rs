@@ -2,39 +2,36 @@
 /// Implements weighted score calculation formula
 
 /// Calculate weighted score from sub-scores
-/// 
+///
 /// Formula: score = 100 * (1 - ∏(1 - sᵢ/100/2ⁱ))
 /// Where sub-scores are sorted in descending order
-/// 
+///
 /// # Arguments
 /// * `sub_scores` - Vector of sub-scores (reasons)
-/// 
+///
 /// # Returns
 /// Total weighted score (0.0 to 100.0)
 pub fn calculate_weighted_score(sub_scores: &[i16]) -> f64 {
     if sub_scores.is_empty() {
         return 0.0;
     }
-    
+
     // Filter positive scores and sort descending
-    let mut sorted: Vec<i16> = sub_scores.iter()
-        .filter(|&&s| s > 0)
-        .copied()
-        .collect();
-    
+    let mut sorted: Vec<i16> = sub_scores.iter().filter(|&&s| s > 0).copied().collect();
+
     if sorted.is_empty() {
         return 0.0;
     }
-    
-    sorted.sort_by(|a, b| b.cmp(a));  // Descending order
-    
+
+    sorted.sort_by(|a, b| b.cmp(a)); // Descending order
+
     // Calculate product: ∏(1 - sᵢ/100/2ⁱ)
     let mut product = 1.0;
     for (i, &score) in sorted.iter().enumerate() {
         let term = 1.0 - (score as f64 / 100.0 / 2_f64.powi(i as i32));
         product *= term;
     }
-    
+
     // Final score: 100 * (1 - product)
     100.0 * (1.0 - product)
 }
@@ -105,4 +102,3 @@ mod tests {
         assert!((result - 84.195859375).abs() < 0.01);
     }
 }
-

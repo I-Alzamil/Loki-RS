@@ -1,6 +1,6 @@
-use std::time::{Duration, Instant};
-use std::thread;
 use std::cell::RefCell;
+use std::thread;
+use std::time::{Duration, Instant};
 
 thread_local! {
     pub static THROTTLER: RefCell<CpuThrottler> = RefCell::new(CpuThrottler::new(100));

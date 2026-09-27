@@ -1,24 +1,23 @@
-use std::{fs};
-use std::io::{Cursor, Read};
-use std::path::Path;
-use std::time::{UNIX_EPOCH};
-use std::sync::Arc;
 use arrayvec::ArrayVec;
-use filesize::PathExt;
-use file_format::FileFormat;
 use chrono::offset::Utc;
 use chrono::prelude::*;
-use regex::Regex;
-use sha2::{Sha256, Digest};
-use sha1::*;
-use memmap2::MmapOptions;
-use walkdir::{WalkDir, DirEntry};
-use yara_x::{Scanner, Rules};
+use file_format::FileFormat;
+use filesize::PathExt;
 use rayon::prelude::*;
+use regex::Regex;
+use sha1::*;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{self, Cursor, Read};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+use walkdir::{DirEntry, WalkDir};
+use yara_x::{Rules, Scanner};
 use zip::ZipArchive;
 
 #[cfg(windows)]
-use windows::core::{PCWSTR, HSTRING};
+use windows::core::PCWSTR;
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
 
@@ -38,15 +37,20 @@ const DRIVE_CDROM: u32 = 5;
 #[cfg(windows)]
 const DRIVE_RAMDISK: u32 = 6;
 
-use crate::{ScanConfig, GenMatch, HashIOCCollections, FalsePositiveHashCollections, ExtVars, YaraMatch, FilenameIOC, find_hash_ioc};
-use crate::helpers::score::calculate_weighted_score;
-use crate::helpers::unified_logger::{UnifiedLogger, MatchReason, LogLevel};
-use crate::helpers::throttler::{throttle_start, throttle_end_with_limit};
 use crate::helpers::helpers::log_access_error;
 use crate::helpers::interrupt::ScanState;
+use crate::helpers::score::calculate_weighted_score;
+use crate::helpers::throttler::{throttle_end_with_limit, throttle_start};
+use crate::helpers::unified_logger::{LogLevel, MatchReason, UnifiedLogger};
+use crate::{
+    find_hash_ioc, ExtVars, FalsePositiveHashCollections, FilenameIOC, GenMatch,
+    HashIOCCollections, ScanConfig, YaraMatch,
+};
 
-const REL_EXTS: &'static [&'static str] = &[".exe", ".dll", ".bat", ".ps1", ".asp", ".aspx", ".jsp", ".jspx", 
-    ".php", ".plist", ".sh", ".vbs", ".js", ".dmp", ".py", ".msix"];
+const REL_EXTS: &'static [&'static str] = &[
+    ".exe", ".dll", ".bat", ".ps1", ".asp", ".aspx", ".jsp", ".jspx", ".php", ".plist", ".sh",
+    ".vbs", ".js", ".dmp", ".py", ".msix",
+];
 const FILE_TYPES: &'static [&'static str] = &[
     "Debian Binary Package",
     "Executable and Linkable Format",
@@ -60,11 +64,8 @@ const FILE_TYPES: &'static [&'static str] = &[
     "Windows Executable",
     "Windows Shortcut",
     "ZIP",
-];  // see https://docs.rs/file-format/latest/file_format/index.html
-const ALL_DRIVE_EXCLUDES: &'static [&'static str] = &[
-    "/Library/CloudStorage/",
-    "/Volumes/"
-];
+]; // see https://docs.rs/file-format/latest/file_format/index.html
+const ALL_DRIVE_EXCLUDES: &'static [&'static str] = &["/Library/CloudStorage/", "/Volumes/"];
 
 // Cloud storage root folder segment allowlist.
 // Matching is done on normalized path segments (not substring matches).
@@ -101,15 +102,10 @@ const LINUX_PATH_SKIPS_START: &'static [&'static str] = &[
 ];
 
 // Linux/Mac mounted devices (excluded unless --scan-all-drives)
-const MOUNTED_DEVICES: &'static [&'static str] = &[
-    "/media",
-    "/volumes",
-];
+const MOUNTED_DEVICES: &'static [&'static str] = &["/media", "/volumes"];
 
 // Linux/Mac path exclusions (end of path)
-const LINUX_PATH_SKIPS_END: &'static [&'static str] = &[
-    "/initctl",
-];
+const LINUX_PATH_SKIPS_END: &'static [&'static str] = &["/initctl"];
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -161,20 +157,52 @@ fn is_cloud_or_remote_path(path: &str) -> bool {
     false
 }
 
+#[cfg(any(windows, test))]
+fn windows_drive_root(path: &str) -> Option<String> {
+    let path = path.trim_matches('"').replace('/', "\\");
+
+    if path.len() >= 6 && path[..4].eq_ignore_ascii_case(r"\\?\") {
+        let bytes = path.as_bytes();
+        if bytes.get(4).is_some_and(|b| b.is_ascii_alphabetic()) && bytes.get(5) == Some(&b':') {
+            return Some(format!(r"\\?\{}:\", bytes[4] as char));
+        }
+    }
+
+    if path.len() >= 8 && path[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        let rest = &path[8..];
+        let mut parts = rest.split('\\').filter(|part| !part.is_empty());
+        let server = parts.next()?;
+        let share = parts.next()?;
+        return Some(format!(r"\\?\UNC\{}\{}\", server, share));
+    }
+
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        let mut parts = rest.split('\\').filter(|part| !part.is_empty());
+        let server = parts.next()?;
+        let share = parts.next()?;
+        return Some(format!(r"\\{}\{}\", server, share));
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some(format!("{}:\\", bytes[0] as char));
+    }
+
+    None
+}
+
 // Check if a root path is a network drive (Windows only)
 #[cfg(windows)]
 fn is_network_drive(path: &str) -> bool {
-    // Need a root path like "C:\" or "\\server\share"
-    // If path is just a letter "C:", append backslash
-    let root = if path.len() == 2 && path.chars().nth(1) == Some(':') {
-        format!("{}\\", path)
-    } else {
-        path.to_string()
+    // GetDriveTypeW expects a root such as "C:\" or "\\server\share\".
+    // Passing a full path can return DRIVE_NO_ROOT_DIR and falsely look remote.
+    let Some(root) = windows_drive_root(path) else {
+        return false;
     };
-    
-    let h_root = HSTRING::from(&root);
-    let drive_type = unsafe { GetDriveTypeW(PCWSTR(h_root.as_ptr())) };
-    
+
+    let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(root_wide.as_ptr())) };
+
     // DRIVE_REMOTE = 4, DRIVE_NO_ROOT_DIR = 1
     drive_type == DRIVE_REMOTE || drive_type == DRIVE_NO_ROOT_DIR
 }
@@ -190,7 +218,16 @@ fn is_network_filesystem(fs_type: &str) -> bool {
     let fs_lower = fs_type.to_lowercase();
     matches!(
         fs_lower.as_str(),
-        "nfs" | "nfs4" | "cifs" | "smbfs" | "smb3" | "sshfs" | "fuse.sshfs" | "afp" | "webdav" | "davfs2"
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smbfs"
+            | "smb3"
+            | "sshfs"
+            | "fuse.sshfs"
+            | "afp"
+            | "webdav"
+            | "davfs2"
     )
 }
 
@@ -230,26 +267,29 @@ fn is_special_linux_filesystem(fs_type: &str) -> bool {
 #[cfg(windows)]
 pub fn enumerate_windows_drives(scan_hard_drives: bool, scan_all_drives: bool) -> Vec<String> {
     let mut drives = Vec::new();
-    
+
     if !scan_hard_drives && !scan_all_drives {
         return drives;
     }
-    
+
     let drive_mask = unsafe { GetLogicalDrives() };
-    
+
     for i in 0..26 {
         if (drive_mask & (1 << i)) != 0 {
             let drive_letter = (b'A' + i as u8) as char;
             let drive_path = format!("{}:\\", drive_letter);
-            
-            let h_drive = HSTRING::from(&drive_path);
-            let drive_type = unsafe { GetDriveTypeW(PCWSTR(h_drive.as_ptr())) };
-            
+
+            let drive_wide: Vec<u16> = drive_path
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let drive_type = unsafe { GetDriveTypeW(PCWSTR(drive_wide.as_ptr())) };
+
             // Skip invalid drives
             if drive_type == DRIVE_NO_ROOT_DIR {
                 continue;
             }
-            
+
             // Filter based on flags
             if scan_hard_drives {
                 // Only include fixed drives (local hard drives)
@@ -264,7 +304,7 @@ pub fn enumerate_windows_drives(scan_hard_drives: bool, scan_all_drives: bool) -
             }
         }
     }
-    
+
     drives
 }
 
@@ -272,36 +312,36 @@ pub fn enumerate_windows_drives(scan_hard_drives: bool, scan_all_drives: bool) -
 #[cfg(target_os = "linux")]
 pub fn enumerate_linux_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> Vec<String> {
     let mut mounts = Vec::new();
-    
+
     if !scan_hard_drives && !scan_all_drives {
         return mounts;
     }
-    
+
     // Read /proc/mounts
     if let Ok(content) = fs::read_to_string("/proc/mounts") {
         let mut root_found = false;
-        
+
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 3 {
                 continue;
             }
-            
+
             let mount_point = parts[1];
             let fs_type = parts[2];
-            
+
             // Skip special filesystems
             let special_fs = is_special_linux_filesystem(fs_type);
-            
+
             if special_fs {
                 continue;
             }
-            
+
             // Track if root filesystem is found
             if mount_point == "/" {
                 root_found = true;
             }
-            
+
             if scan_hard_drives {
                 // Only include local filesystems
                 if !is_network_filesystem(fs_type) {
@@ -316,7 +356,7 @@ pub fn enumerate_linux_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> 
                 }
             }
         }
-        
+
         // Always ensure root is included if it's a local filesystem and scan_hard_drives is set
         if scan_hard_drives && !root_found {
             // Try to add root if it wasn't found (shouldn't happen, but safety check)
@@ -325,7 +365,7 @@ pub fn enumerate_linux_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> 
             }
         }
     }
-    
+
     mounts
 }
 
@@ -333,16 +373,16 @@ pub fn enumerate_linux_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> 
 #[cfg(target_os = "macos")]
 pub fn enumerate_macos_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> Vec<String> {
     let mut mounts = Vec::new();
-    
+
     if !scan_hard_drives && !scan_all_drives {
         return mounts;
     }
-    
+
     // Always include root filesystem
     if scan_hard_drives || scan_all_drives {
         mounts.push("/".to_string());
     }
-    
+
     // Read /etc/mtab for mount information on macOS
     // Note: /etc/mtab may not exist on all macOS versions, so we also check /Volumes
     if let Ok(content) = fs::read_to_string("/etc/mtab") {
@@ -351,25 +391,25 @@ pub fn enumerate_macos_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> 
             if parts.len() < 3 {
                 continue;
             }
-            
+
             let mount_point = parts[1];
             let fs_type = parts[2];
-            
+
             // Skip root (already added)
             if mount_point == "/" {
                 continue;
             }
-            
+
             // Skip special filesystems
             let special_fs = matches!(
                 fs_type,
                 "devfs" | "fdesc" | "linprocfs" | "linsysfs" | "tmpfs"
             );
-            
+
             if special_fs {
                 continue;
             }
-            
+
             if scan_hard_drives {
                 // Only include local filesystems
                 if !is_network_filesystem(fs_type) {
@@ -385,7 +425,7 @@ pub fn enumerate_macos_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> 
             }
         }
     }
-    
+
     // Also scan /Volumes directory for external drives on macOS
     // This catches drives that might not be in /etc/mtab
     if scan_hard_drives || scan_all_drives {
@@ -407,7 +447,7 @@ pub fn enumerate_macos_mounts(scan_hard_drives: bool, scan_all_drives: bool) -> 
             }
         }
     }
-    
+
     mounts
 }
 
@@ -417,24 +457,24 @@ pub fn enumerate_drives(scan_hard_drives: bool, scan_all_drives: bool) -> Vec<St
     {
         enumerate_windows_drives(scan_hard_drives, scan_all_drives)
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         enumerate_linux_mounts(scan_hard_drives, scan_all_drives)
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         enumerate_macos_mounts(scan_hard_drives, scan_all_drives)
     }
-    
+
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         Vec::new()
     }
 }
 
-use crate::modules::{ScanModule, ScanContext, ModuleResult};
+use crate::modules::{ModuleResult, ScanContext, ScanModule};
 
 pub struct FileScanModule;
 
@@ -453,13 +493,13 @@ impl ScanModule for FileScanModule {
             context.filename_iocs,
             context.exclusion_patterns,
             context.logger,
-            context.scan_state.as_ref()
+            context.scan_state.as_ref(),
         )
     }
 }
 
 // Scan a given file system path
-pub fn scan_path (
+pub fn scan_path(
     target_folder: &str,
     compiled_rules: &Rules,
     scan_config: &ScanConfig,
@@ -468,10 +508,10 @@ pub fn scan_path (
     filename_iocs: &Vec<FilenameIOC>,
     exclusion_patterns: &Vec<Regex>,
     logger: &UnifiedLogger,
-    scan_state: Option<&Arc<ScanState>>) -> (usize, usize, usize, usize, usize) {
-    
+    scan_state: Option<&Arc<ScanState>>,
+) -> (usize, usize, usize, usize, usize) {
     let cpu_limit = scan_config.cpu_limit;
-    
+
     // Check if target folder itself is on a network drive or cloud path
     // When scan_hard_drives is true: skip network drives but allow local drives
     // When scan_all_drives is true: don't skip anything
@@ -481,10 +521,13 @@ pub fn scan_path (
             logger.warning(&format!("Skipping network drive TARGET: {}", target_folder));
             return (0, 0, 0, 0, 0);
         }
-        
+
         // Still skip cloud storage paths even when scanning hard drives
         if is_cloud_or_remote_path(target_folder) {
-            logger.warning(&format!("Skipping cloud storage folder TARGET: {}", target_folder));
+            logger.warning(&format!(
+                "Skipping cloud storage folder TARGET: {}",
+                target_folder
+            ));
             return (0, 0, 0, 0, 0);
         }
     } else if !scan_config.scan_all_drives {
@@ -493,23 +536,27 @@ pub fn scan_path (
             logger.warning(&format!("Skipping network drive TARGET: {}", target_folder));
             return (0, 0, 0, 0, 0);
         }
-        
+
         if is_cloud_or_remote_path(target_folder) {
-            logger.warning(&format!("Skipping cloud storage folder TARGET: {}", target_folder));
+            logger.warning(&format!(
+                "Skipping cloud storage folder TARGET: {}",
+                target_folder
+            ));
             return (0, 0, 0, 0, 0);
         }
     }
     // When scan_all_drives is true, don't skip anything
-    
+
     // Walk the file system (don't follow symlinks to match v1 behavior)
     let walk = WalkDir::new(target_folder)
-        .follow_links(false)  // Match v1 behavior: followlinks=False
+        .follow_links(false) // Match v1 behavior: followlinks=False
         .into_iter();
-        
+
     let scan_state_ref = scan_state.cloned();
 
     // Process files in parallel
-    let (files_scanned, files_matched, alert_count, warning_count, notice_count) = walk.par_bridge()
+    let (files_scanned, files_matched, alert_count, warning_count, notice_count) = walk
+        .par_bridge()
         .map(|entry_res| {
             match entry_res {
                 Ok(entry) => {
@@ -523,15 +570,16 @@ pub fn scan_path (
                         filename_iocs,
                         exclusion_patterns,
                         logger,
-                        scan_state_ref.as_ref()
+                        scan_state_ref.as_ref(),
                     );
                     // Use dynamic CPU limit from ScanState if available
-                    let current_cpu_limit = scan_state_ref.as_ref()
+                    let current_cpu_limit = scan_state_ref
+                        .as_ref()
                         .map(|s| s.get_cpu_limit())
                         .unwrap_or(cpu_limit);
                     throttle_end_with_limit(current_cpu_limit);
                     result
-                },
+                }
                 Err(e) => {
                     log_access_error(logger, "fs_object", &e, scan_config.show_access_errors);
                     if let Some(ref state) = scan_state_ref {
@@ -543,17 +591,39 @@ pub fn scan_path (
         })
         .reduce(
             || (0, 0, 0, 0, 0),
-            |a, b| (
-                a.0 + b.0,
-                a.1 + b.1,
-                a.2 + b.2,
-                a.3 + b.3,
-                a.4 + b.4
-            )
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
         );
-            
+
     // Return summary statistics
-    (files_scanned, files_matched, alert_count, warning_count, notice_count)
+    (
+        files_scanned,
+        files_matched,
+        alert_count,
+        warning_count,
+        notice_count,
+    )
+}
+
+/// Read an owned snapshot, returning `None` if the actual data exceeds the limit.
+/// Read at most one extra byte to detect growth or inaccurate archive metadata,
+/// without adding one to the limit (which could overflow).
+fn read_bounded<R: Read>(mut reader: R, max_size: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut content = Vec::new();
+    reader
+        .by_ref()
+        .take(max_size as u64)
+        .read_to_end(&mut content)?;
+
+    if content.len() == max_size {
+        let mut extra = [0u8; 1];
+        match reader.read_exact(&mut extra) {
+            Ok(()) => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(Some(content))
 }
 
 fn process_file_entry(
@@ -565,7 +635,7 @@ fn process_file_entry(
     filename_iocs: &Vec<FilenameIOC>,
     exclusion_patterns: &Vec<Regex>,
     logger: &UnifiedLogger,
-    scan_state: Option<&Arc<ScanState>>
+    scan_state: Option<&Arc<ScanState>>,
 ) -> (usize, usize, usize, usize, usize) {
     let mut files_scanned = 0;
     let mut files_matched = 0;
@@ -578,9 +648,13 @@ fn process_file_entry(
 
     // Check interrupt state
     if let Some(state) = scan_state {
-        if state.should_stop() { return (0, 0, 0, 0, 0); }
+        if state.should_stop() {
+            return (0, 0, 0, 0, 0);
+        }
         state.wait_for_resume();
-        if state.should_stop() { return (0, 0, 0, 0, 0); }
+        if state.should_stop() {
+            return (0, 0, 0, 0, 0);
+        }
         state.set_current_element(file_path_str.to_string());
         state.increment_files();
     }
@@ -588,17 +662,27 @@ fn process_file_entry(
     // Never scan symlink/reparse-point entries. This avoids following links
     // into excluded or slow/unavailable locations.
     if entry.path_is_symlink() {
-        logger.debug(&format!("Skipping symbolic link/reparse point FILE: {}", file_path_str));
-        if let Some(state) = scan_state { state.increment_skipped(); }
+        logger.debug(&format!(
+            "Skipping symbolic link/reparse point FILE: {}",
+            file_path_str
+        ));
+        if let Some(state) = scan_state {
+            state.increment_skipped();
+        }
         return (0, 0, 0, 0, 0);
     }
-    
+
     // Always exclude the program's own directory to prevent scanning itself
     if let Some(ref program_dir) = scan_config.program_dir {
         let program_dir_path = Path::new(program_dir);
         if file_path.starts_with(program_dir_path) {
-            logger.debug(&format!("Skipping program directory FILE: {} PROGRAM_DIR: {}", file_path_str, program_dir));
-            if let Some(state) = scan_state { state.increment_skipped(); }
+            logger.debug(&format!(
+                "Skipping program directory FILE: {} PROGRAM_DIR: {}",
+                file_path_str, program_dir
+            ));
+            if let Some(state) = scan_state {
+                state.increment_skipped();
+            }
             return (0, 0, 0, 0, 0);
         }
     }
@@ -606,8 +690,14 @@ fn process_file_entry(
     // Check custom exclusion patterns from config/excludes.cfg
     for pattern in exclusion_patterns.iter() {
         if pattern.is_match(&file_path_str) {
-            logger.debug(&format!("Skipping excluded path (config pattern) FILE: {} PATTERN: {}", file_path_str, pattern.as_str()));
-            if let Some(state) = scan_state { state.increment_skipped(); }
+            logger.debug(&format!(
+                "Skipping excluded path (config pattern) FILE: {} PATTERN: {}",
+                file_path_str,
+                pattern.as_str()
+            ));
+            if let Some(state) = scan_state {
+                state.increment_skipped();
+            }
             return (0, 0, 0, 0, 0);
         }
     }
@@ -621,8 +711,13 @@ fn process_file_entry(
     // Cloud/Network exclusions (skip if path contains cloud keywords)
     // Always exclude cloud paths unless scan_all_drives is true
     if !scan_config.scan_all_drives && is_cloud_or_remote_path(&file_path_str) {
-        logger.debug(&format!("Skipping cloud storage path FILE: {}", file_path_str));
-        if let Some(state) = scan_state { state.increment_skipped(); }
+        logger.debug(&format!(
+            "Skipping cloud storage path FILE: {}",
+            file_path_str
+        ));
+        if let Some(state) = scan_state {
+            state.increment_skipped();
+        }
         return (0, 0, 0, 0, 0);
     }
 
@@ -630,162 +725,308 @@ fn process_file_entry(
     if cfg!(unix) {
         for skip_path in LINUX_PATH_SKIPS_START.iter() {
             if file_path_str.starts_with(skip_path) {
-                logger.debug(&format!("Skipping excluded path (start) FILE: {} MATCH: {}", file_path_str, skip_path));
-                if let Some(state) = scan_state { state.increment_skipped(); }
+                logger.debug(&format!(
+                    "Skipping excluded path (start) FILE: {} MATCH: {}",
+                    file_path_str, skip_path
+                ));
+                if let Some(state) = scan_state {
+                    state.increment_skipped();
+                }
                 return (0, 0, 0, 0, 0);
             }
         }
         if exclude_mounted {
             for skip_path in MOUNTED_DEVICES.iter() {
                 if file_path_str.starts_with(skip_path) {
-                    logger.debug(&format!("Skipping mounted device FILE: {} MATCH: {}", file_path_str, skip_path));
-                    if let Some(state) = scan_state { state.increment_skipped(); }
+                    logger.debug(&format!(
+                        "Skipping mounted device FILE: {} MATCH: {}",
+                        file_path_str, skip_path
+                    ));
+                    if let Some(state) = scan_state {
+                        state.increment_skipped();
+                    }
                     return (0, 0, 0, 0, 0);
                 }
             }
         }
         for skip_path in LINUX_PATH_SKIPS_END.iter() {
             if file_path_str.ends_with(skip_path) {
-                logger.debug(&format!("Skipping excluded path (end) FILE: {} MATCH: {}", file_path_str, skip_path));
-                if let Some(state) = scan_state { state.increment_skipped(); }
+                logger.debug(&format!(
+                    "Skipping excluded path (end) FILE: {} MATCH: {}",
+                    file_path_str, skip_path
+                ));
+                if let Some(state) = scan_state {
+                    state.increment_skipped();
+                }
                 return (0, 0, 0, 0, 0);
             }
         }
     }
-    
+
     // Skip certain drives and folders (macOS/Windows)
     for skip_dir_value in ALL_DRIVE_EXCLUDES.iter() {
         if file_path_str.contains(skip_dir_value) {
-            if let Some(state) = scan_state { state.increment_skipped(); }
+            if let Some(state) = scan_state {
+                state.increment_skipped();
+            }
             return (0, 0, 0, 0, 0);
         }
     }
-    
+
     // Skip all elements that aren't files (directories, symlinks, etc.)
     if !entry.file_type().is_file() {
-        logger.debug(&format!("Skipped element that isn't a file ELEMENT: {}", entry.path().display()));
+        logger.debug(&format!(
+            "Skipped element that isn't a file ELEMENT: {}",
+            entry.path().display()
+        ));
         // Don't count directories as skipped - only files
         return (0, 0, 0, 0, 0);
     };
-    
+
     // Skip big files
     let metadata = match entry.path().symlink_metadata() {
         Ok(m) => m,
-        Err(e) => { 
+        Err(e) => {
             log_access_error(logger, &file_path_str, &e, scan_config.show_access_errors);
             return (0, 0, 0, 0, 0);
         }
     };
-    let realsize = entry.path().size_on_disk_fast(&metadata).unwrap_or(metadata.len());
-    if realsize > scan_config.max_file_size as u64 || metadata.len() > scan_config.max_file_size as u64 { 
-        logger.debug(&format!("Skipping file due to size FILE: {} SIZE: {} MAX_FILE_SIZE: {}", 
-        entry.path().display(), realsize, scan_config.max_file_size));
-        if let Some(state) = scan_state { state.increment_skipped(); }
-        return (0, 0, 0, 0, 0); 
+    let realsize = entry
+        .path()
+        .size_on_disk_fast(&metadata)
+        .unwrap_or(metadata.len());
+    if realsize > scan_config.max_file_size as u64
+        || metadata.len() > scan_config.max_file_size as u64
+    {
+        logger.debug(&format!(
+            "Skipping file due to size FILE: {} SIZE: {} MAX_FILE_SIZE: {}",
+            entry.path().display(),
+            realsize,
+            scan_config.max_file_size
+        ));
+        if let Some(state) = scan_state {
+            state.increment_skipped();
+        }
+        return (0, 0, 0, 0, 0);
     }
-    
+
     // Type detection
-    let extension_raw = entry.path()
+    let extension_raw = entry
+        .path()
         .extension()
         .map(|ext| ext.to_string_lossy().to_string())
         .unwrap_or_default();
     let file_format = FileFormat::from_file(entry.path()).unwrap_or_default();
-    let _file_format_desc = file_format.name(); 
-    let file_type_long = file_format.to_owned().to_string(); 
+    let _file_format_desc = file_format.name();
+    let file_type_long = file_format.to_owned().to_string();
 
     // Check if file should be scanned
     let matches_file_type = FILE_TYPES.contains(&file_type_long.as_str());
-    let matches_extension = if extension_raw.is_empty() { false } else {
+    let matches_extension = if extension_raw.is_empty() {
+        false
+    } else {
         let ext_with_dot = format!(".{}", extension_raw);
         REL_EXTS.contains(&ext_with_dot.as_str())
     };
-    
+
     if !matches_file_type && !matches_extension && !scan_config.scan_all_types {
-        logger.debug(&format!("Skipping file due to extension or type FILE: {} EXT: {:?} TYPE: {:?}", 
-            entry.path().display(), extension_raw, file_type_long));
-        if let Some(state) = scan_state { state.increment_skipped(); }
+        logger.debug(&format!(
+            "Skipping file due to extension or type FILE: {} EXT: {:?} TYPE: {:?}",
+            entry.path().display(),
+            extension_raw,
+            file_type_long
+        ));
+        if let Some(state) = scan_state {
+            state.increment_skipped();
+        }
         return (0, 0, 0, 0, 0);
     }
 
-    logger.debug(&format!("Scanning file {} TYPE: {:?}", entry.path().display(), file_type_long));
-    
+    logger.debug(&format!(
+        "Scanning file {} TYPE: {:?}",
+        entry.path().display(),
+        file_type_long
+    ));
+
     // READ FILE
     let file = match fs::File::open(entry.path()) {
         Ok(f) => f,
-        Err(e) => { 
-            log_access_error(logger, &file_path_str, &e, scan_config.show_access_errors);
-            return (0, 0, 0, 0, 0); 
-        }
-    };
-    let mmap = match unsafe { MmapOptions::new().map(&file) } {
-        Ok(m) => m,
         Err(e) => {
             log_access_error(logger, &file_path_str, &e, scan_config.show_access_errors);
-            return (0, 0, 0, 0, 0); 
+            return (0, 0, 0, 0, 0);
+        }
+    };
+    // Keep scan data independent of the live file: a concurrent truncation of a
+    // memory mapping can otherwise terminate the process with SIGBUS.
+    let content = match read_bounded(file, scan_config.max_file_size) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            logger.debug(&format!(
+                "Skipping file that exceeded size limit while reading FILE: {} MAX_FILE_SIZE: {}",
+                file_path_str, scan_config.max_file_size
+            ));
+            if let Some(state) = scan_state {
+                state.increment_skipped();
+            }
+            return (0, 0, 0, 0, 0);
+        }
+        Err(e) => {
+            log_access_error(logger, &file_path_str, &e, scan_config.show_access_errors);
+            return (0, 0, 0, 0, 0);
         }
     };
 
     // Timestamps
-    let msecs = metadata.modified().map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()).unwrap_or(0);
-    let asecs = metadata.accessed().map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()).unwrap_or(0);
-    let csecs = metadata.created().map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()).unwrap_or(0);
+    let msecs = metadata
+        .modified()
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        .unwrap_or(0);
+    let asecs = metadata
+        .accessed()
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        .unwrap_or(0);
+    let csecs = metadata
+        .created()
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        .unwrap_or(0);
 
     // Scan the file itself
     let (s, m, a, w, n) = scan_memory_buffer(
-        &mmap, &file_path_str, 
-        entry.path().file_name().map(|n| n.to_string_lossy()).unwrap_or_default().as_ref(),
-        &extension_raw, &file_format.name().to_ascii_uppercase(), (msecs as i64, asecs as i64, csecs as i64),
-        compiled_rules, scan_config, hash_collections, fp_hash_collections, filename_iocs,
-        logger, scan_state, None, None
+        &content,
+        &file_path_str,
+        entry
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+            .as_ref(),
+        &extension_raw,
+        &file_format.name().to_ascii_uppercase(),
+        (msecs as i64, asecs as i64, csecs as i64),
+        compiled_rules,
+        scan_config,
+        hash_collections,
+        fp_hash_collections,
+        filename_iocs,
+        logger,
+        scan_state,
+        None,
+        None,
     );
-    files_scanned += s; files_matched += m; alert_count += a; warning_count += w; notice_count += n;
+    files_scanned += s;
+    files_matched += m;
+    alert_count += a;
+    warning_count += w;
+    notice_count += n;
 
     // Check for archive (if archive scanning is enabled)
     if file_format == FileFormat::Zip && scan_config.scan_archives {
         logger.debug(&format!("Scanning ZIP archive content: {}", file_path_str));
         // Calculate container info for linking
-        let md5_val = format!("{:x}", md5::compute(&mmap));
-        let sha1_val = hex::encode(Sha1::new().chain_update(&mmap).finalize());
-        let sha256_val = hex::encode(Sha256::new().chain_update(&mmap).finalize());
-        let mtime = Utc.timestamp_opt(msecs as i64, 0).single().unwrap_or_else(|| Utc::now());
-        let atime = Utc.timestamp_opt(asecs as i64, 0).single().unwrap_or_else(|| Utc::now());
-        let ctime = Utc.timestamp_opt(csecs as i64, 0).single().unwrap_or_else(|| Utc::now());
-        
+        let md5_val = format!("{:x}", md5::compute(&content));
+        let sha1_val = hex::encode(Sha1::new().chain_update(&content).finalize());
+        let sha256_val = hex::encode(Sha256::new().chain_update(&content).finalize());
+        let mtime = Utc
+            .timestamp_opt(msecs as i64, 0)
+            .single()
+            .unwrap_or_else(|| Utc::now());
+        let atime = Utc
+            .timestamp_opt(asecs as i64, 0)
+            .single()
+            .unwrap_or_else(|| Utc::now());
+        let ctime = Utc
+            .timestamp_opt(csecs as i64, 0)
+            .single()
+            .unwrap_or_else(|| Utc::now());
+
         let container_info = SampleInfo {
-            md5: md5_val, sha1: sha1_val, sha256: sha256_val,
-            atime: atime.to_rfc3339(), mtime: mtime.to_rfc3339(), ctime: ctime.to_rfc3339(),
+            md5: md5_val,
+            sha1: sha1_val,
+            sha256: sha256_val,
+            atime: atime.to_rfc3339(),
+            mtime: mtime.to_rfc3339(),
+            ctime: ctime.to_rfc3339(),
         };
 
-        match ZipArchive::new(Cursor::new(&mmap)) {
+        match ZipArchive::new(Cursor::new(&content)) {
             Ok(mut archive) => {
                 for i in 0..archive.len() {
                     if let Ok(mut zfile) = archive.by_index(i) {
-                        if zfile.is_file() && zfile.size() < scan_config.max_file_size as u64 {
-                            let mut buffer = Vec::with_capacity(zfile.size() as usize);
-                            if zfile.read_to_end(&mut buffer).is_ok() {
-                                let entry_name = zfile.name().to_string();
-                                let display_path = format!("{}->{}", file_path_str, entry_name);
-                                let ext = Path::new(&entry_name).extension().map(|e| e.to_string_lossy()).unwrap_or_default();
-                                
-                                let (s, m, a, w, n) = scan_memory_buffer(
-                                    &buffer, &display_path, &entry_name, &ext, "ARCHIVE_ENTRY",
-                                    (0, 0, 0), // Timestamps inside zip? zfile.last_modified()
-                                    compiled_rules, scan_config, hash_collections, fp_hash_collections, filename_iocs,
-                                    logger, scan_state, 
-                                    Some(&container_info), Some(&file_path_str)
-                                );
-                                files_scanned += s; files_matched += m; alert_count += a; warning_count += w; notice_count += n;
+                        if zfile.is_file() {
+                            let entry_name = zfile.name().to_string();
+                            let display_path = format!("{}->{}", file_path_str, entry_name);
+                            if zfile.size() > scan_config.max_file_size as u64 {
+                                logger.debug(&format!(
+                                    "Skipping ZIP entry due to size FILE: {} SIZE: {} MAX_FILE_SIZE: {}",
+                                    display_path, zfile.size(), scan_config.max_file_size
+                                ));
+                                continue;
                             }
+                            let buffer = match read_bounded(&mut zfile, scan_config.max_file_size) {
+                                Ok(Some(buffer)) => buffer,
+                                Ok(None) => {
+                                    logger.debug(&format!(
+                                        "Skipping ZIP entry that exceeded decompressed size limit FILE: {} MAX_FILE_SIZE: {}",
+                                        display_path, scan_config.max_file_size
+                                    ));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    logger.debug(&format!(
+                                        "Failed to read ZIP entry FILE: {} ERROR: {}",
+                                        display_path, e
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let ext = Path::new(&entry_name)
+                                .extension()
+                                .map(|e| e.to_string_lossy())
+                                .unwrap_or_default();
+
+                            let (s, m, a, w, n) = scan_memory_buffer(
+                                &buffer,
+                                &display_path,
+                                &entry_name,
+                                &ext,
+                                "ARCHIVE_ENTRY",
+                                (0, 0, 0), // Timestamps inside zip? zfile.last_modified()
+                                compiled_rules,
+                                scan_config,
+                                hash_collections,
+                                fp_hash_collections,
+                                filename_iocs,
+                                logger,
+                                scan_state,
+                                Some(&container_info),
+                                Some(&file_path_str),
+                            );
+                            files_scanned += s;
+                            files_matched += m;
+                            alert_count += a;
+                            warning_count += w;
+                            notice_count += n;
                         }
                     }
                 }
-            },
-            Err(e) => logger.debug(&format!("Failed to open ZIP archive {}: {:?}", file_path_str, e)),
+            }
+            Err(e) => logger.debug(&format!(
+                "Failed to open ZIP archive {}: {:?}",
+                file_path_str, e
+            )),
         }
     }
 
-    if let Some(state) = scan_state { state.clear_current_element(); }
-    (files_scanned, files_matched, alert_count, warning_count, notice_count)
+    if let Some(state) = scan_state {
+        state.clear_current_element();
+    }
+    (
+        files_scanned,
+        files_matched,
+        alert_count,
+        warning_count,
+        notice_count,
+    )
 }
 
 fn scan_memory_buffer(
@@ -795,8 +1036,8 @@ fn scan_memory_buffer(
     extension: &str,
     filetype: &str,
     timestamps: (i64, i64, i64), // mtime, atime, ctime (secs)
-    compiled_rules: &Rules, 
-    scan_config: &ScanConfig, 
+    compiled_rules: &Rules,
+    scan_config: &ScanConfig,
     hash_collections: &HashIOCCollections,
     fp_hash_collections: &FalsePositiveHashCollections,
     filename_iocs: &Vec<FilenameIOC>,
@@ -810,13 +1051,19 @@ fn scan_memory_buffer(
     let mut alert_count = 0;
     let mut warning_count = 0;
     let mut notice_count = 0;
-    
+
     // Convert timestamps (mtime, atime, ctime) to RFC3339 strings
-    let mtime_str = Utc.timestamp_opt(timestamps.0, 0).single()
+    let mtime_str = Utc
+        .timestamp_opt(timestamps.0, 0)
+        .single()
         .map(|dt| dt.to_rfc3339());
-    let atime_str = Utc.timestamp_opt(timestamps.1, 0).single()
+    let atime_str = Utc
+        .timestamp_opt(timestamps.1, 0)
+        .single()
         .map(|dt| dt.to_rfc3339());
-    let ctime_str = Utc.timestamp_opt(timestamps.2, 0).single()
+    let ctime_str = Utc
+        .timestamp_opt(timestamps.2, 0)
+        .single()
         .map(|dt| dt.to_rfc3339());
 
     let mut sample_matches = ArrayVec::<GenMatch, 100>::new();
@@ -825,22 +1072,30 @@ fn scan_memory_buffer(
     for fioc in filename_iocs.iter() {
         if !sample_matches.is_full() {
             if fioc.regex.is_match(path_display) || fioc.regex.is_match(filename_str) {
-                 let is_false_positive = if let Some(ref fp_regex) = fioc.regex_fp {
+                let is_false_positive = if let Some(ref fp_regex) = fioc.regex_fp {
                     fp_regex.is_match(path_display) || fp_regex.is_match(filename_str)
-                 } else { false };
-                 
-                 if !is_false_positive {
+                } else {
+                    false
+                };
+
+                if !is_false_positive {
                     let match_message = format!("File Name IOC matched PATTERN: {}", fioc.pattern);
-                    sample_matches.insert(sample_matches.len(), GenMatch { 
-                        message: match_message, 
-                        score: fioc.score,
-                        description: Some(fioc.description.clone()),
-                        author: None,
-                        reference: None,
-                        matched_strings: None,
-                    });
-                    logger.debug(&format!("Filename IOC match FILE: {} PATTERN: {} SCORE: {}", path_display, fioc.pattern, fioc.score));
-                 }
+                    sample_matches.insert(
+                        sample_matches.len(),
+                        GenMatch {
+                            message: match_message,
+                            score: fioc.score,
+                            description: Some(fioc.description.clone()),
+                            author: None,
+                            reference: None,
+                            matched_strings: None,
+                        },
+                    );
+                    logger.debug(&format!(
+                        "Filename IOC match FILE: {} PATTERN: {} SCORE: {}",
+                        path_display, fioc.pattern, fioc.score
+                    ));
+                }
             }
         }
     }
@@ -849,52 +1104,65 @@ fn scan_memory_buffer(
     let md5_value = format!("{:x}", md5::compute(content));
     let sha1_value = hex::encode(Sha1::new().chain_update(content).finalize());
     let sha256_value = hex::encode(Sha256::new().chain_update(content).finalize());
-    
+
     // FP Check
-    if find_hash_ioc(&md5_value, &fp_hash_collections.md5_iocs).is_some() ||
-       find_hash_ioc(&sha1_value, &fp_hash_collections.sha1_iocs).is_some() ||
-       find_hash_ioc(&sha256_value, &fp_hash_collections.sha256_iocs).is_some() {
-        logger.debug(&format!("File skipped due to false positive hash match FILE: {}", path_display));
+    if find_hash_ioc(&md5_value, &fp_hash_collections.md5_iocs).is_some()
+        || find_hash_ioc(&sha1_value, &fp_hash_collections.sha1_iocs).is_some()
+        || find_hash_ioc(&sha256_value, &fp_hash_collections.sha256_iocs).is_some()
+    {
+        logger.debug(&format!(
+            "File skipped due to false positive hash match FILE: {}",
+            path_display
+        ));
         return (1, 0, 0, 0, 0);
     }
-    
+
     // Hash IOCs
     if !sample_matches.is_full() {
         if let Some(ioc) = find_hash_ioc(&md5_value, &hash_collections.md5_iocs) {
-             let match_message = format!("HASH match with IOC HASH: {}", ioc.hash_value);
-             sample_matches.insert(sample_matches.len(), GenMatch{
-                 message: match_message, 
-                 score: ioc.score,
-                 description: Some(ioc.description.clone()),
-                 author: None,
-                 reference: None,
-                 matched_strings: None,
-             });
+            let match_message = format!("HASH match with IOC HASH: {}", ioc.hash_value);
+            sample_matches.insert(
+                sample_matches.len(),
+                GenMatch {
+                    message: match_message,
+                    score: ioc.score,
+                    description: Some(ioc.description.clone()),
+                    author: None,
+                    reference: None,
+                    matched_strings: None,
+                },
+            );
         }
         if let Some(ioc) = find_hash_ioc(&sha1_value, &hash_collections.sha1_iocs) {
-             let match_message = format!("HASH match with IOC HASH: {}", ioc.hash_value);
-             sample_matches.insert(sample_matches.len(), GenMatch{
-                 message: match_message, 
-                 score: ioc.score,
-                 description: Some(ioc.description.clone()),
-                 author: None,
-                 reference: None,
-                 matched_strings: None,
-             });
+            let match_message = format!("HASH match with IOC HASH: {}", ioc.hash_value);
+            sample_matches.insert(
+                sample_matches.len(),
+                GenMatch {
+                    message: match_message,
+                    score: ioc.score,
+                    description: Some(ioc.description.clone()),
+                    author: None,
+                    reference: None,
+                    matched_strings: None,
+                },
+            );
         }
         if let Some(ioc) = find_hash_ioc(&sha256_value, &hash_collections.sha256_iocs) {
-             let match_message = format!("HASH match with IOC HASH: {}", ioc.hash_value);
-             sample_matches.insert(sample_matches.len(), GenMatch{
-                 message: match_message, 
-                 score: ioc.score,
-                 description: Some(ioc.description.clone()),
-                 author: None,
-                 reference: None,
-                 matched_strings: None,
-             });
+            let match_message = format!("HASH match with IOC HASH: {}", ioc.hash_value);
+            sample_matches.insert(
+                sample_matches.len(),
+                GenMatch {
+                    message: match_message,
+                    score: ioc.score,
+                    description: Some(ioc.description.clone()),
+                    author: None,
+                    reference: None,
+                    matched_strings: None,
+                },
+            );
         }
     }
-    
+
     let _sample_info = SampleInfo {
         md5: md5_value.clone(),
         sha1: sha1_value.clone(),
@@ -912,19 +1180,65 @@ fn scan_memory_buffer(
         filetype: filetype.to_string(),
         owner: "".to_string(),
     };
-    
-    let yara_matches = scan_file(compiled_rules, content, scan_config, &ext_vars, path_display, logger);
+
+    let (yara_matches, yara_timed_out) = scan_file(
+        compiled_rules,
+        content,
+        scan_config,
+        &ext_vars,
+        path_display,
+        logger,
+    );
+    if yara_timed_out {
+        let message = format!(
+            "YARA scan timeout while scanning FILE: {} - skipping and continuing",
+            path_display
+        );
+        warning_count += 1;
+        if let Some(state) = scan_state {
+            state.add_warnings(1);
+        }
+        logger.file_scan_warning(
+            path_display,
+            &message,
+            filetype,
+            content.len() as u64,
+            &md5_value,
+            &sha1_value,
+            &sha256_value,
+            Some((ctime_str.clone(), mtime_str.clone(), atime_str.clone())),
+        );
+    }
     for ymatch in yara_matches.iter() {
         if !sample_matches.is_full() {
             let match_message = format!("YARA match with rule {}", ymatch.rulename);
-            sample_matches.insert(sample_matches.len(), GenMatch{
-                message: match_message, 
-                score: ymatch.score,
-                description: if ymatch.description.is_empty() { None } else { Some(ymatch.description.clone()) },
-                author: if ymatch.author.is_empty() { None } else { Some(ymatch.author.clone()) },
-                reference: if ymatch.reference.is_empty() { None } else { Some(ymatch.reference.clone()) },
-                matched_strings: if ymatch.matched_strings.is_empty() { None } else { Some(ymatch.matched_strings.clone()) },
-            });
+            sample_matches.insert(
+                sample_matches.len(),
+                GenMatch {
+                    message: match_message,
+                    score: ymatch.score,
+                    description: if ymatch.description.is_empty() {
+                        None
+                    } else {
+                        Some(ymatch.description.clone())
+                    },
+                    author: if ymatch.author.is_empty() {
+                        None
+                    } else {
+                        Some(ymatch.author.clone())
+                    },
+                    reference: if ymatch.reference.is_empty() {
+                        None
+                    } else {
+                        Some(ymatch.reference.clone())
+                    },
+                    matched_strings: if ymatch.matched_strings.is_empty() {
+                        None
+                    } else {
+                        Some(ymatch.matched_strings.clone())
+                    },
+                },
+            );
         }
     }
 
@@ -933,28 +1247,39 @@ fn scan_memory_buffer(
         matched = 1;
         let sub_scores: Vec<i16> = sample_matches.iter().map(|m| m.score).collect();
         let total_score = calculate_weighted_score(&sub_scores).round() as i16;
-        
+
         let log_level = if total_score as f64 >= scan_config.alert_threshold as f64 {
             alert_count += 1;
-            if let Some(state) = scan_state { state.add_alerts(1); }
+            if let Some(state) = scan_state {
+                state.add_alerts(1);
+            }
             LogLevel::Alert
         } else if total_score as f64 >= scan_config.warning_threshold as f64 {
             warning_count += 1;
-            if let Some(state) = scan_state { state.add_warnings(1); }
+            if let Some(state) = scan_state {
+                state.add_warnings(1);
+            }
             LogLevel::Warning
         } else if total_score as f64 >= scan_config.notice_threshold as f64 {
             notice_count += 1;
-            if let Some(state) = scan_state { state.add_notices(1); }
+            if let Some(state) = scan_state {
+                state.add_notices(1);
+            }
             LogLevel::Notice
         } else {
-            logger.debug(&format!("Match below threshold FILE: {} SCORE: {}", path_display, total_score));
+            logger.debug(&format!(
+                "Match below threshold FILE: {} SCORE: {}",
+                path_display, total_score
+            ));
             return (scanned, 0, 0, 0, 0);
         };
-        
+
         let reasons_to_show = std::cmp::min(sample_matches.len(), scan_config.max_reasons);
-        let shown_reasons: Vec<MatchReason> = sample_matches.iter().take(reasons_to_show)
-            .map(|m| MatchReason { 
-                message: m.message.clone(), 
+        let shown_reasons: Vec<MatchReason> = sample_matches
+            .iter()
+            .take(reasons_to_show)
+            .map(|m| MatchReason {
+                message: m.message.clone(),
                 score: m.score,
                 description: m.description.clone(),
                 author: m.author.clone(),
@@ -962,7 +1287,7 @@ fn scan_memory_buffer(
                 matched_strings: m.matched_strings.clone(),
             })
             .collect();
-        
+
         // Unified Logging call
         logger.file_match(
             log_level,
@@ -978,7 +1303,7 @@ fn scan_memory_buffer(
             Some((ctime_str.clone(), mtime_str.clone(), atime_str.clone())),
         );
     }
-    
+
     (scanned, matched, alert_count, warning_count, notice_count)
 }
 
@@ -1006,13 +1331,12 @@ fn scan_file(
     ext_vars: &ExtVars,
     file_label: &str,
     logger: &UnifiedLogger,
-) -> ArrayVec<YaraMatch, 100> {
+) -> (ArrayVec<YaraMatch, 100>, bool) {
     // YARA-X: Create scanner from rules
     let mut scanner = Scanner::new(rules);
-    
-    // Set timeout (in seconds)
-    scanner.set_timeout(std::time::Duration::from_secs(10));
-    
+
+    scanner.set_timeout(std::time::Duration::from_secs(scan_config.yara_timeout));
+
     // Define external variables (global variables in YARA-X)
     // YARA-X accepts strings directly for set_global
     if let Err(e) = scanner.set_global("filename", ext_vars.filename.as_str()) {
@@ -1030,12 +1354,13 @@ fn scan_file(
     if let Err(e) = scanner.set_global("owner", ext_vars.owner.as_str()) {
         log::debug!("Error setting owner global: {:?}", e);
     }
-    
-    // Scan file content directly (already in memory/mmap)
+
+    // Scan the owned file content directly.
     let results = scanner.scan(file_content);
-    
+
     // Handle scan results
     let mut yara_matches = ArrayVec::<YaraMatch, 100>::new();
+    let mut timed_out = false;
     match results {
         Ok(scan_results) => {
             // YARA-X: Use matching_rules() to iterate over results
@@ -1043,13 +1368,13 @@ fn scan_file(
                 if !yara_matches.is_full() {
                     // Extract rule identifier
                     let rulename = matching_rule.identifier().to_string();
-                    
+
                     // Extract metadata from rule
                     let mut description = String::new();
                     let mut author = String::new();
                     let mut reference = String::new();
                     let mut score = 75; // Default score
-                    
+
                     // Get rule metadata - YARA-X metadata() returns iterator of (key, MetaValue)
                     for (key, value) in matching_rule.metadata() {
                         match key {
@@ -1060,33 +1385,27 @@ fn scan_file(
                                     _ => {}
                                 }
                             }
-                            "author" => {
-                                match value {
-                                    yara_x::MetaValue::String(s) => author = s.to_string(),
-                                    _ => {}
-                                }
-                            }
-                            "reference" => {
-                                match value {
-                                    yara_x::MetaValue::String(s) => reference = s.to_string(),
-                                    _ => {}
-                                }
-                            }
-                            "score" => {
-                                match value {
-                                    yara_x::MetaValue::Integer(i) => {
-                                        let s = i as i16;
-                                        if s > 0 && s <= 100 {
-                                            score = s;
-                                        }
+                            "author" => match value {
+                                yara_x::MetaValue::String(s) => author = s.to_string(),
+                                _ => {}
+                            },
+                            "reference" => match value {
+                                yara_x::MetaValue::String(s) => reference = s.to_string(),
+                                _ => {}
+                            },
+                            "score" => match value {
+                                yara_x::MetaValue::Integer(i) => {
+                                    let s = i as i16;
+                                    if s > 0 && s <= 100 {
+                                        score = s;
                                     }
-                                    _ => {}
                                 }
-                            }
+                                _ => {}
+                            },
                             _ => {}
                         }
                     }
-                    
+
                     // Extract matched strings from patterns
                     let mut matched_strings: Vec<String> = Vec::new();
                     for pattern in matching_rule.patterns() {
@@ -1094,50 +1413,129 @@ fn scan_file(
                             let identifier = pattern.identifier();
                             let offset = pattern_match.range().start;
                             let data = pattern_match.data();
-                            
+
                             // Format string match
                             let value_str = format_yara_matched_data(data);
-                            
-                            matched_strings.push(format!("{}: {} @ {}", identifier, value_str, offset));
+
+                            matched_strings
+                                .push(format!("{}: {} @ {}", identifier, value_str, offset));
                         }
                     }
-                    
+
                     log::debug!("YARA-X match found RULE: {} SCORE: {}", rulename, score);
-                    
+
                     yara_matches.insert(
                         yara_matches.len(),
-                        YaraMatch{
+                        YaraMatch {
                             rulename: rulename,
                             score: score,
                             description: description,
                             author: author,
                             reference: reference,
                             matched_strings: matched_strings,
-                        }
+                        },
                     );
                 }
             }
-        },
+        }
         Err(e) => {
             let err_text = format!("{:?}", e);
             if err_text.to_lowercase().contains("timeout") {
-                logger.warning(&format!(
-                    "YARA scan timeout while scanning FILE: {} - skipping and continuing",
-                    file_label
-                ));
+                timed_out = true;
             } else if scan_config.show_access_errors {
-                logger.error(&format!("YARA-X scan error FILE: {} ERROR: {:?}", file_label, e));
+                logger.error(&format!(
+                    "YARA-X scan error FILE: {} ERROR: {:?}",
+                    file_label, e
+                ));
             } else {
-                logger.debug(&format!("YARA-X scan error FILE: {} ERROR: {:?}", file_label, e));
+                logger.debug(&format!(
+                    "YARA-X scan error FILE: {} ERROR: {:?}",
+                    file_label, e
+                ));
             }
         }
     }
-    return yara_matches;
+    (yara_matches, timed_out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod bounded_read_tests {
+        use super::*;
+        use std::io::Write;
+
+        #[test]
+        fn oversized_input_stops_after_one_extra_byte() {
+            let mut input = Cursor::new(vec![b'A'; 64]);
+            assert!(read_bounded(&mut input, 8).unwrap().is_none());
+            assert_eq!(input.position(), 9);
+        }
+
+        #[test]
+        fn accepts_complete_input_up_to_the_limit() {
+            for limit in [4, 5, usize::MAX] {
+                assert_eq!(
+                    read_bounded(Cursor::new(b"data"), limit).unwrap(),
+                    Some(b"data".to_vec())
+                );
+            }
+            assert_eq!(read_bounded(io::empty(), 0).unwrap(), Some(Vec::new()));
+            assert!(read_bounded(Cursor::new(b"x"), 0).unwrap().is_none());
+        }
+
+        #[test]
+        fn owned_content_survives_source_file_truncation() {
+            let path = std::env::temp_dir().join(format!(
+                "loki-owned-snapshot-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let original = vec![b'A'; 8192];
+            writer.write_all(&original).unwrap();
+            let snapshot = read_bounded(fs::File::open(&path).unwrap(), original.len())
+                .unwrap()
+                .unwrap();
+            writer.set_len(0).unwrap();
+            drop(writer);
+            fs::remove_file(&path).unwrap();
+
+            assert_eq!(snapshot, original);
+        }
+
+        #[test]
+        fn zip_entry_with_underreported_size_is_bounded() {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file(
+                    "payload.bin",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(&vec![b'A'; 64 * 1024]).unwrap();
+            let mut data = writer.finish().unwrap().into_inner();
+
+            // Lie about the uncompressed size in both ZIP headers. The actual
+            // deflate stream still expands to 64 KiB.
+            data[22..26].copy_from_slice(&1u32.to_le_bytes());
+            let central = data.windows(4).position(|s| s == b"PK\x01\x02").unwrap();
+            data[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+            let mut archive = ZipArchive::new(Cursor::new(data)).unwrap();
+            let mut entry = archive.by_index(0).unwrap();
+            assert_eq!(entry.size(), 1);
+            assert!(read_bounded(&mut entry, 1024).unwrap().is_none());
+        }
+    }
 
     mod extension_tests {
         use super::*;
@@ -1191,6 +1589,41 @@ mod tests {
         use super::*;
 
         #[test]
+        fn test_windows_drive_root_from_full_path_with_spaces() {
+            let path = r"J:\SteamLibrary\steamapps\common\SpaceCraft beta";
+            assert_eq!(windows_drive_root(path).as_deref(), Some(r"J:\"));
+        }
+
+        #[test]
+        fn test_windows_drive_root_from_forward_slashes() {
+            let path = "J:/SteamLibrary/steamapps/common/SpaceCraft beta";
+            assert_eq!(windows_drive_root(path).as_deref(), Some(r"J:\"));
+        }
+
+        #[test]
+        fn test_windows_drive_root_from_drive_only() {
+            assert_eq!(windows_drive_root("J:").as_deref(), Some(r"J:\"));
+        }
+
+        #[test]
+        fn test_windows_drive_root_from_unc_path() {
+            let path = r"\\server\share\SteamLibrary\steamapps\common\SpaceCraft beta";
+            assert_eq!(
+                windows_drive_root(path).as_deref(),
+                Some(r"\\server\share\")
+            );
+        }
+
+        #[test]
+        fn test_windows_drive_root_from_extended_unc_path() {
+            let path = r"\\?\UNC\server\share\SteamLibrary\SpaceCraft beta";
+            assert_eq!(
+                windows_drive_root(path).as_deref(),
+                Some(r"\\?\UNC\server\share\")
+            );
+        }
+
+        #[test]
         fn test_linux_path_skips_proc() {
             assert!(LINUX_PATH_SKIPS_START.contains(&"/proc"));
         }
@@ -1233,22 +1666,30 @@ mod tests {
         #[test]
         fn test_path_skip_matching_start() {
             let test_path = "/proc/1234/cmdline";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| test_path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| test_path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_path_skip_matching_end() {
             let test_path = "/some/path/initctl";
-            let should_skip = LINUX_PATH_SKIPS_END.iter().any(|skip| test_path.ends_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_END
+                .iter()
+                .any(|skip| test_path.ends_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_regular_path_not_skipped() {
             let test_path = "/home/user/documents/file.txt";
-            let should_skip_start = LINUX_PATH_SKIPS_START.iter().any(|skip| test_path.starts_with(skip));
-            let should_skip_end = LINUX_PATH_SKIPS_END.iter().any(|skip| test_path.ends_with(skip));
+            let should_skip_start = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| test_path.starts_with(skip));
+            let should_skip_end = LINUX_PATH_SKIPS_END
+                .iter()
+                .any(|skip| test_path.ends_with(skip));
             assert!(!should_skip_start);
             assert!(!should_skip_end);
         }
@@ -1262,7 +1703,8 @@ mod tests {
             let info = SampleInfo {
                 md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
                 sha1: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
-                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
                 atime: "2024-01-01T00:00:00Z".to_string(),
                 mtime: "2024-01-01T00:00:00Z".to_string(),
                 ctime: "2024-01-01T00:00:00Z".to_string(),
@@ -1541,77 +1983,99 @@ mod tests {
         #[test]
         fn test_proc_cmdline_excluded() {
             let path = "/proc/1234/cmdline";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_proc_exe_excluded() {
             let path = "/proc/1/exe";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_dev_null_excluded() {
             let path = "/dev/null";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_dev_sda_excluded() {
             let path = "/dev/sda1";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_sys_kernel_debug_excluded() {
             let path = "/sys/kernel/debug/tracing/trace";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_sys_kernel_tracing_excluded() {
             let path = "/sys/kernel/tracing/events";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_sys_kernel_slab_excluded() {
             let path = "/sys/kernel/slab/kmalloc-64";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_sys_devices_excluded() {
             let path = "/sys/devices/pci0000:00/0000:00:1f.0";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_sys_class_excluded() {
             let path = "/sys/class/net/eth0/address";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_run_user_excluded() {
             let path = "/run/user/1000/systemd/notify";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
         #[test]
         fn test_usr_src_linux_excluded() {
             let path = "/usr/src/linux/kernel/sched.c";
-            let should_skip = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(should_skip);
         }
 
@@ -1646,7 +2110,9 @@ mod tests {
         #[test]
         fn test_home_path_not_excluded() {
             let path = "/home/user/.local/bin/app";
-            let should_skip_start = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip_start = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             let should_skip_end = LINUX_PATH_SKIPS_END.iter().any(|skip| path.ends_with(skip));
             let should_skip_mounted = MOUNTED_DEVICES.iter().any(|skip| path.starts_with(skip));
             assert!(!should_skip_start);
@@ -1657,21 +2123,27 @@ mod tests {
         #[test]
         fn test_usr_bin_not_excluded() {
             let path = "/usr/bin/python3";
-            let should_skip_start = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip_start = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(!should_skip_start);
         }
 
         #[test]
         fn test_etc_not_excluded() {
             let path = "/etc/passwd";
-            let should_skip_start = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip_start = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(!should_skip_start);
         }
 
         #[test]
         fn test_var_log_not_excluded() {
             let path = "/var/log/syslog";
-            let should_skip_start = LINUX_PATH_SKIPS_START.iter().any(|skip| path.starts_with(skip));
+            let should_skip_start = LINUX_PATH_SKIPS_START
+                .iter()
+                .any(|skip| path.starts_with(skip));
             assert!(!should_skip_start);
         }
     }
@@ -1759,7 +2231,11 @@ mod tests {
             let patterns = create_test_exclusion_patterns();
             let path = "/proc/1234/cmdline";
             let excluded = patterns.iter().any(|p| p.is_match(path));
-            assert!(excluded, "Path {} should be excluded by config pattern", path);
+            assert!(
+                excluded,
+                "Path {} should be excluded by config pattern",
+                path
+            );
         }
 
         #[test]
@@ -1767,7 +2243,11 @@ mod tests {
             let patterns = create_test_exclusion_patterns();
             let path = "/dev/null";
             let excluded = patterns.iter().any(|p| p.is_match(path));
-            assert!(excluded, "Path {} should be excluded by config pattern", path);
+            assert!(
+                excluded,
+                "Path {} should be excluded by config pattern",
+                path
+            );
         }
 
         #[test]
@@ -1796,7 +2276,11 @@ mod tests {
             ];
             for path in paths {
                 let excluded = patterns.iter().any(|p| p.is_match(path));
-                assert!(excluded, "Path {} should be excluded by node_modules pattern", path);
+                assert!(
+                    excluded,
+                    "Path {} should be excluded by node_modules pattern",
+                    path
+                );
             }
         }
 
@@ -1817,13 +2301,14 @@ mod tests {
         #[test]
         fn test_socat_binary_excluded() {
             let patterns = create_test_exclusion_patterns();
-            let paths = vec![
-                "/usr/bin/socat",
-                "/usr/bin/socat1",
-            ];
+            let paths = vec!["/usr/bin/socat", "/usr/bin/socat1"];
             for path in paths {
                 let excluded = patterns.iter().any(|p| p.is_match(path));
-                assert!(excluded, "Path {} should be excluded by socat pattern", path);
+                assert!(
+                    excluded,
+                    "Path {} should be excluded by socat pattern",
+                    path
+                );
             }
         }
 
@@ -1862,8 +2347,14 @@ mod tests {
             let excluded_lower = patterns.iter().any(|p| p.is_match(path_lower));
             let excluded_upper = patterns.iter().any(|p| p.is_match(path_upper));
 
-            assert!(!excluded_lower, "Lowercase .tmp should NOT match uppercase .TMP pattern");
-            assert!(excluded_upper, "Uppercase .TMP should match uppercase .TMP pattern");
+            assert!(
+                !excluded_lower,
+                "Lowercase .tmp should NOT match uppercase .TMP pattern"
+            );
+            assert!(
+                excluded_upper,
+                "Uppercase .TMP should match uppercase .TMP pattern"
+            );
         }
 
         #[test]
@@ -1879,7 +2370,11 @@ mod tests {
 
             for path in paths {
                 let excluded = patterns.iter().any(|p| p.is_match(path));
-                assert!(excluded, "Path {} should be excluded by case-insensitive pattern", path);
+                assert!(
+                    excluded,
+                    "Path {} should be excluded by case-insensitive pattern",
+                    path
+                );
             }
         }
     }

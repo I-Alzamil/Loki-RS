@@ -1,13 +1,13 @@
 //! HTML Report Generator
-//! 
+//!
 //! Generates a styled HTML report from JSONL scan findings.
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::collections::BTreeMap;
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
+use std::path::{Path, PathBuf};
 
 use crate::ScanConfig;
 
@@ -64,62 +64,87 @@ pub struct ReportData {
 
 /// Generate an HTML report from a JSONL file
 /// Returns the path to the generated HTML file on success
-pub fn generate_report(jsonl_path: &str, scan_config: &ScanConfig, version: &str) -> Result<String, String> {
-    // Determine output path (same as JSONL but with .html extension)
-    let html_path = jsonl_path.replace(".jsonl", ".html");
-    
+pub fn generate_report(
+    jsonl_path: &str,
+    scan_config: &ScanConfig,
+    version: &str,
+) -> Result<String, String> {
+    let html_path = report_output_path(Path::new(jsonl_path));
+    if matches!(
+        (std::fs::canonicalize(jsonl_path), std::fs::canonicalize(&html_path)),
+        (Ok(input), Ok(output)) if input == output
+    ) {
+        return Err("HTML output path must differ from the JSONL input path".to_string());
+    }
+
     // Read and parse JSONL
     let report_data = parse_jsonl(jsonl_path)?;
-    
+
     // Generate HTML
     let html_content = render_html(&report_data, scan_config, version, jsonl_path);
-    
+
     // Write HTML file
-    let mut file = File::create(&html_path)
-        .map_err(|e| format!("Failed to create HTML file: {}", e))?;
+    let mut file =
+        File::create(&html_path).map_err(|e| format!("Failed to create HTML file: {}", e))?;
     file.write_all(html_content.as_bytes())
         .map_err(|e| format!("Failed to write HTML file: {}", e))?;
-    
-    Ok(html_path)
+
+    Ok(html_path.to_string_lossy().into_owned())
+}
+
+/// Change only the filename extension, and keep HTML-named inputs intact.
+fn report_output_path(input: &Path) -> PathBuf {
+    if input
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("html"))
+    {
+        let mut output = input.as_os_str().to_os_string();
+        output.push(".html");
+        PathBuf::from(output)
+    } else {
+        input.with_extension("html")
+    }
 }
 
 pub fn parse_jsonl(path: &str) -> Result<ReportData, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
     let reader = BufReader::new(file);
-    
+
     let mut scan_start = None;
     let mut scan_end = None;
     let mut info_events = Vec::new();
     let mut findings = Vec::new();
-    
+
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
         if line.trim().is_empty() {
             continue;
         }
-        
+
         let event: LogEvent = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(_) => continue, // Skip malformed lines
         };
-        
+
         match event.event_type.as_str() {
             "scan_start" => scan_start = Some(event),
             "scan_end" => scan_end = Some(event),
-            "file_match" | "process_match" => findings.push(event),
+            "file_match" | "file_scan_warning" | "process_match" => findings.push(event),
             "info" => info_events.push(event),
             _ => {}
         }
     }
-    
+
     // Sort findings by score descending
     findings.sort_by(|a, b| {
         let score_a = a.score.unwrap_or(0.0);
         let score_b = b.score.unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    
+
     Ok(ReportData {
         scan_start,
         scan_end,
@@ -128,69 +153,97 @@ pub fn parse_jsonl(path: &str) -> Result<ReportData, String> {
     })
 }
 
-pub fn render_html(data: &ReportData, scan_config: &ScanConfig, version: &str, jsonl_path: &str) -> String {
-    let hostname = data.scan_start.as_ref()
+pub fn render_html(
+    data: &ReportData,
+    scan_config: &ScanConfig,
+    version: &str,
+    jsonl_path: &str,
+) -> String {
+    let hostname = data
+        .scan_start
+        .as_ref()
         .map(|e| e.hostname.clone())
         .unwrap_or_else(|| "Unknown".to_string());
-    
-    let scan_start_time = data.scan_start.as_ref()
+
+    let scan_start_time = data
+        .scan_start
+        .as_ref()
         .map(|e| e.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "Unknown".to_string());
-    
-    let scan_end_time = data.scan_end.as_ref()
+
+    let scan_end_time = data
+        .scan_end
+        .as_ref()
         .map(|e| e.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "Unknown".to_string());
-    
+
     // Extract command line flags from info events
-    let cmd_flags = data.info_events.iter()
+    let cmd_flags = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Command line flags"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
+
     // Extract OS info
-    let os_info = data.info_events.iter()
+    let os_info = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Operating system"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
+
     // Extract CPU info
-    let cpu_info = data.info_events.iter()
+    let cpu_info = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("CPU information"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
+
     // Extract memory info
-    let memory_info = data.info_events.iter()
+    let memory_info = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Memory information"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
+
     // Extract network info
-    let network_info = data.info_events.iter()
+    let network_info = data
+        .info_events
+        .iter()
         .find(|e| e.message.contains("Network interfaces"))
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    
+
     // Extract disk info - collect all disk entries
-    let disk_info: Vec<String> = data.info_events.iter()
+    let disk_info: Vec<String> = data
+        .info_events
+        .iter()
         .filter(|e| e.message.contains("Hard disk"))
         .map(|e| e.message.clone())
         .collect();
-    
+
     // Count findings by level
     let alert_count = data.findings.iter().filter(|f| f.level == "ALERT").count();
-    let warning_count = data.findings.iter().filter(|f| f.level == "WARNING").count();
+    let warning_count = data
+        .findings
+        .iter()
+        .filter(|f| f.level == "WARNING")
+        .count();
     let notice_count = data.findings.iter().filter(|f| f.level == "NOTICE").count();
-    
+
     // Get JSONL filename for display
     let jsonl_filename = Path::new(jsonl_path)
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| jsonl_path.to_string());
-    
+
     let findings_html = render_findings(&data.findings);
-    
-    format!(r##"<!DOCTYPE html>
+
+    format!(
+        r##"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1393,7 +1446,7 @@ pub fn render_html(data: &ReportData, scan_config: &ScanConfig, version: &str, j
         // =====================================================
         // PERFORMANCE-OPTIMIZED FILTER SYSTEM
         // =====================================================
-        const STORAGE_KEY = 'loki_filters_' + '{jsonl_filename}'.replace(/[^a-zA-Z0-9]/g, '_');
+        const STORAGE_KEY = 'loki_filters_{jsonl_storage_key}';
         let filterList = [];
         let selectedText = '';
         
@@ -1680,7 +1733,7 @@ pub fn render_html(data: &ReportData, scan_config: &ScanConfig, version: &str, j
         function escapeHtml(text) {{
             const div = document.createElement('div');
             div.textContent = text;
-            return div.innerHTML;
+            return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }}
         
         function truncateText(text, maxLen) {{
@@ -1737,11 +1790,19 @@ pub fn render_html(data: &ReportData, scan_config: &ScanConfig, version: &str, j
         cmd_flags = html_escape(&cmd_flags),
         cpu_info = html_escape(&cpu_info),
         memory_info = html_escape(&memory_info),
-        network_info = if network_info.is_empty() { "Not available".to_string() } else { html_escape(&network_info) },
-        disk_info_html = if disk_info.is_empty() { 
-            "Not available".to_string() 
-        } else { 
-            disk_info.iter().map(|d| html_escape(d)).collect::<Vec<_>>().join("<br>") 
+        network_info = if network_info.is_empty() {
+            "Not available".to_string()
+        } else {
+            html_escape(&network_info)
+        },
+        disk_info_html = if disk_info.is_empty() {
+            "Not available".to_string()
+        } else {
+            disk_info
+                .iter()
+                .map(|d| html_escape(d))
+                .collect::<Vec<_>>()
+                .join("<br>")
         },
         alert_threshold = scan_config.alert_threshold,
         warning_threshold = scan_config.warning_threshold,
@@ -1756,6 +1817,10 @@ pub fn render_html(data: &ReportData, scan_config: &ScanConfig, version: &str, j
         warning_count = warning_count,
         notice_count = notice_count,
         jsonl_filename = html_escape(&jsonl_filename),
+        jsonl_storage_key = jsonl_filename
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>(),
         findings_html = findings_html,
     )
 }
@@ -1765,15 +1830,16 @@ fn render_findings(findings: &[LogEvent]) -> String {
         return r#"<div class="no-findings">
             <h2>✓ No Findings</h2>
             <p>The scan completed without detecting any threats above the configured thresholds.</p>
-        </div>"#.to_string();
+        </div>"#
+            .to_string();
     }
-    
+
     let mut html = String::new();
-    
+
     for (idx, finding) in findings.iter().enumerate() {
         html.push_str(&render_finding_card(finding, idx));
     }
-    
+
     html
 }
 
@@ -1784,29 +1850,33 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
         "warning" => "warning",
         _ => "notice",
     };
-    
+
     let score = finding.score.unwrap_or(0.0).round() as i16;
-    
-    let path_or_name = finding.file_path.as_deref()
+
+    let path_or_name = finding
+        .file_path
+        .as_deref()
         .or(finding.process_name.as_deref())
         .unwrap_or("Unknown");
-    
-    let finding_type = if finding.file_path.is_some() {
+
+    let finding_type = if finding.event_type == "file_scan_warning" {
+        "File Scan Warning"
+    } else if finding.file_path.is_some() {
         finding.file_type.as_deref().unwrap_or("File")
     } else {
         "Process"
     };
-    
+
     // Build details section
     let mut details_html = String::new();
-    
+
     if let Some(size) = finding.file_size {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">Size:</span> <span class="detail-value">{}</span></div>"#,
             format_size(size as usize)
         ));
     }
-    
+
     // Display file created timestamp
     if let Some(ref created) = finding.file_created {
         let formatted = format_rfc3339_to_datetime(created);
@@ -1815,65 +1885,71 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
             html_escape(&formatted)
         ));
     }
-    
+
     if let Some(pid) = finding.pid {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">PID:</span> <span class="detail-value">{}</span></div>"#,
             pid
         ));
     }
-    
+
     if let Some(ref mem) = finding.memory_bytes {
         details_html.push_str(&format!(
             r#"<div class="detail-item"><span class="detail-label">Memory:</span> <span class="detail-value">{}</span></div>"#,
             format_size(*mem as usize)
         ));
     }
-    
+
     if let Some(ref md5) = finding.md5 {
         details_html.push_str(&format!(
             r#"<div class="detail-item-hash"><span class="detail-label">MD5:</span> <a href="https://www.virustotal.com/gui/search/{}" target="_blank" class="detail-value hash-link" title="Search on VirusTotal">{}</a><button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this hash">✖</button></div>"#,
-            html_escape(md5), html_escape(md5), html_escape(md5)
+            html_escape(md5), html_escape(md5), js_html_attribute_escape(md5)
         ));
     }
-    
+
     if let Some(ref sha1) = finding.sha1 {
         details_html.push_str(&format!(
             r#"<div class="detail-item-hash"><span class="detail-label">SHA1:</span> <a href="https://www.virustotal.com/gui/search/{}" target="_blank" class="detail-value hash-link" title="Search on VirusTotal">{}</a><button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this hash">✖</button></div>"#,
-            html_escape(sha1), html_escape(sha1), html_escape(sha1)
+            html_escape(sha1), html_escape(sha1), js_html_attribute_escape(sha1)
         ));
     }
-    
+
     if let Some(ref sha256) = finding.sha256 {
         details_html.push_str(&format!(
             r#"<div class="detail-item-hash"><span class="detail-label">SHA256:</span> <a href="https://www.virustotal.com/gui/search/{}" target="_blank" class="detail-value hash-link" title="Search on VirusTotal">{}</a><button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this hash">✖</button></div>"#,
-            html_escape(sha256), html_escape(sha256), html_escape(sha256)
+            html_escape(sha256), html_escape(sha256), js_html_attribute_escape(sha256)
         ));
     }
-    
+
     // Build reasons section (sorted by score descending)
     let reasons_html = if let Some(ref reasons) = finding.reasons {
         // Sort reasons by score descending
         let mut sorted_reasons: Vec<_> = reasons.iter().collect();
         sorted_reasons.sort_by(|a, b| b.score.cmp(&a.score));
-        
-        let mut reasons_str = String::from(r#"<div class="reasons-section"><h4>Match Reasons</h4>"#);
-        
+
+        let mut reasons_str =
+            String::from(r#"<div class="reasons-section"><h4>Match Reasons</h4>"#);
+
         for reason in sorted_reasons {
             // Extract rule name from message if it's a YARA match (format: "YARA match with rule RULENAME")
-            let rule_name = if reason.message.starts_with("YARA match with rule ") || reason.message.starts_with("YARA-X match with rule ") {
+            let rule_name = if reason.message.starts_with("YARA match with rule ")
+                || reason.message.starts_with("YARA-X match with rule ")
+            {
                 reason.message.split(" rule ").nth(1).map(|s| s.to_string())
             } else {
                 None
             };
-            
+
             let filter_btn = if let Some(ref rn) = rule_name {
-                let escaped_rule = rn.replace('\'', "\\'");
-                format!(r#"<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this rule">✖</button>"#, escaped_rule)
+                let escaped_rule = js_html_attribute_escape(rn);
+                format!(
+                    r#"<button class="filter-btn-inline" onclick="filterValue('{}', event)" title="Filter out this rule">✖</button>"#,
+                    escaped_rule
+                )
             } else {
                 String::new()
             };
-            
+
             reasons_str.push_str(&format!(
                 r#"<div class="reason">
                     <div class="reason-message">{}{} <span style="color: var(--text-secondary);">(Score: {})</span></div>
@@ -1882,21 +1958,21 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
                 filter_btn,
                 reason.score
             ));
-            
+
             if let Some(ref desc) = reason.description {
                 reasons_str.push_str(&format!(
                     r#"<span><strong>Description:</strong> {}</span>"#,
                     html_escape(desc)
                 ));
             }
-            
+
             if let Some(ref author) = reason.author {
                 reasons_str.push_str(&format!(
                     r#"<span><strong>Author:</strong> {}</span>"#,
                     html_escape(author)
                 ));
             }
-            
+
             if let Some(ref reference) = reason.reference {
                 if !reference.is_empty() {
                     if reference.starts_with("http://") || reference.starts_with("https://") {
@@ -1913,14 +1989,14 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
                     }
                 }
             }
-            
+
             reasons_str.push_str("</div>");
-            
+
             // Matched strings (truncated)
             if let Some(ref strings) = reason.matched_strings {
                 if !strings.is_empty() {
                     reasons_str.push_str(r#"<div class="matched-strings"><div class="matched-strings-title">Matched Strings:</div>"#);
-                    
+
                     let visible_count = 5.min(strings.len());
                     for s in strings.iter().take(visible_count) {
                         reasons_str.push_str(&format!(
@@ -1928,7 +2004,7 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
                             html_escape(&truncate_string(s, 100))
                         ));
                     }
-                    
+
                     if strings.len() > visible_count {
                         let hidden_count = strings.len() - visible_count;
                         reasons_str.push_str(&format!(
@@ -1936,37 +2012,36 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
                             <div class="hidden-strings">"#,
                             hidden_count, hidden_count
                         ));
-                        
+
                         for s in strings.iter().skip(visible_count) {
                             reasons_str.push_str(&format!(
                                 r#"<span class="matched-string">{}</span>"#,
                                 html_escape(&truncate_string(s, 100))
                             ));
                         }
-                        
+
                         reasons_str.push_str("</div>");
                     }
-                    
+
                     reasons_str.push_str("</div>");
                 }
             }
-            
+
             reasons_str.push_str("</div>");
         }
-        
+
         reasons_str.push_str("</div>");
         reasons_str
     } else {
         String::new()
     };
-    
+
     // Raw JSON
     let raw_json = serde_json::to_string_pretty(finding).unwrap_or_default();
     let highlighted_json = syntax_highlight_json(&raw_json);
-    
-    // Create a JavaScript-safe version of the path for the onclick handler
-    let path_js_escaped = path_or_name.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
-    
+
+    let path_js_escaped = js_html_attribute_escape(path_or_name);
+
     format!(
         r#"<div class="finding-card" data-level="{level_class}" id="finding-{idx}">
             <div class="finding-header">
@@ -1993,7 +2068,7 @@ fn render_finding_card(finding: &LogEvent, idx: usize) -> String {
         </div>"#,
         level_class = level_class,
         idx = idx,
-        level = level.to_uppercase(),
+        level = html_escape(&level.to_uppercase()),
         score = score,
         path = html_escape(path_or_name),
         path_js = path_js_escaped,
@@ -2012,11 +2087,24 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Escape a single-quoted JavaScript string inside a double-quoted HTML attribute.
+/// HTML decoding happens before the browser evaluates the event handler.
+fn js_html_attribute_escape(s: &str) -> String {
+    html_escape(
+        &s.replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029"),
+    )
+}
+
 fn format_size(bytes: usize) -> String {
     const KB: usize = 1_000;
     const MB: usize = KB * 1_000;
     const GB: usize = MB * 1_000;
-    
+
     if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
@@ -2051,7 +2139,7 @@ fn syntax_highlight_json(json: &str) -> String {
     let mut in_string = false;
     let mut is_key = false;
     let mut current_token = String::new();
-    
+
     while let Some(c) = chars.next() {
         match c {
             '"' => {
@@ -2062,7 +2150,8 @@ fn syntax_highlight_json(json: &str) -> String {
                     if is_key {
                         result.push_str(&format!(r#"<span class="json-key">{}</span>"#, escaped));
                     } else {
-                        result.push_str(&format!(r#"<span class="json-string">{}</span>"#, escaped));
+                        result
+                            .push_str(&format!(r#"<span class="json-string">{}</span>"#, escaped));
                     }
                     current_token.clear();
                     in_string = false;
@@ -2092,13 +2181,22 @@ fn syntax_highlight_json(json: &str) -> String {
                 let mut num = String::new();
                 num.push(c);
                 while let Some(&next) = chars.peek() {
-                    if next.is_numeric() || next == '.' || next == 'e' || next == 'E' || next == '+' || next == '-' {
+                    if next.is_numeric()
+                        || next == '.'
+                        || next == 'e'
+                        || next == 'E'
+                        || next == '+'
+                        || next == '-'
+                    {
                         num.push(chars.next().unwrap());
                     } else {
                         break;
                     }
                 }
-                result.push_str(&format!(r#"<span class="json-number">{}</span>"#, html_escape(&num)));
+                result.push_str(&format!(
+                    r#"<span class="json-number">{}</span>"#,
+                    html_escape(&num)
+                ));
             }
             't' | 'f' => {
                 let mut word = String::new();
@@ -2135,10 +2233,13 @@ fn syntax_highlight_json(json: &str) -> String {
             _ => result.push(c),
         }
     }
-    
+
     // Check if we're looking at a key (simplified: if string is followed by colon)
-    result = result.replace(r#"<span class="json-string">"#, r#"<span class="json-key">"#);
-    
+    result = result.replace(
+        r#"<span class="json-string">"#,
+        r#"<span class="json-key">"#,
+    );
+
     // Fix: properly identify keys vs strings
     // Use char_indices for proper UTF-8 handling
     let mut final_result = String::new();
@@ -2147,7 +2248,7 @@ fn syntax_highlight_json(json: &str) -> String {
     let mut i = 0;
     let span_open = r#"<span class="json-key">"#;
     let span_close = "</span>";
-    
+
     while i < result.len() {
         // Ensure we're at a valid char boundary
         if !result.is_char_boundary(i) {
@@ -2167,12 +2268,21 @@ fn syntax_highlight_json(json: &str) -> String {
                 let after_span = &result[after_span_start..];
                 let trimmed = after_span.trim_start();
                 if trimmed.starts_with(':') {
-                    final_result.push_str(&format!(r#"<span class="json-key">{}</span>"#, span_content));
+                    final_result.push_str(&format!(
+                        r#"<span class="json-key">{}</span>"#,
+                        span_content
+                    ));
                 } else {
-                    final_result.push_str(&format!(r#"<span class="json-string">{}</span>"#, span_content));
+                    final_result.push_str(&format!(
+                        r#"<span class="json-string">{}</span>"#,
+                        span_content
+                    ));
                 }
             } else {
-                final_result.push_str(&format!(r#"<span class="json-string">{}</span>"#, span_content));
+                final_result.push_str(&format!(
+                    r#"<span class="json-string">{}</span>"#,
+                    span_content
+                ));
             }
             i += span_close.len();
         } else if in_span {
@@ -2193,21 +2303,99 @@ fn syntax_highlight_json(json: &str) -> String {
             }
         }
     }
-    
+
     final_result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    #[test]
+    fn test_report_filter_attribute_encoding() {
+        assert_eq!(
+            js_html_attribute_escape("\\'\"<&\n\r\u{2028}\u{2029}"),
+            "\\\\\\&#39;&quot;&lt;&amp;\\n\\r\\u2028\\u2029"
+        );
+
+        let payload = "\"><img src=x onerror=alert(1)>&quot;');alert(2);//\\\n\r";
+        let finding: LogEvent = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-06-18T09:09:29Z",
+            "level": "ALERT",
+            "event_type": "file_match",
+            "hostname": "host",
+            "message": "File Match",
+            "file_path": payload,
+            "md5": payload,
+            "sha1": payload,
+            "sha256": payload,
+            "reasons": [{"message": format!("YARA match with rule {}", payload), "score": 100}]
+        }))
+        .unwrap();
+        let html = render_finding_card(&finding, 0);
+        let handler = "onclick=\"filterValue('&quot;&gt;&lt;img src=x onerror=alert(1)&gt;&amp;quot;\\&#39;);alert(2);//\\\\\\n\\r', event)\"";
+        assert_eq!(html.matches(handler).count(), 5);
+        assert!(!html.contains("<img"));
+    }
+
+    #[test]
+    fn test_report_generation_preserves_input_for_all_filename_extensions() {
+        let directory = std::env::temp_dir().join(format!(
+            "loki-report-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let config = ScanConfig {
+            max_file_size: 1024,
+            show_access_errors: false,
+            scan_all_types: false,
+            scan_hard_drives: false,
+            scan_all_drives: false,
+            scan_archives: false,
+            is_elevated: false,
+            alert_threshold: 80,
+            warning_threshold: 60,
+            notice_threshold: 40,
+            max_reasons: 2,
+            yara_timeout: 10,
+            threads: 1,
+            cpu_limit: 100,
+            exclusion_count: 0,
+            yara_rules_count: 0,
+            ioc_count: 0,
+            program_dir: None,
+        };
+        let jsonl = "{\"timestamp\":\"2026-06-18T09:09:29Z\",\"level\":\"INFO\",\"event_type\":\"scan_start\",\"hostname\":\"host\",\"message\":\"Scan started\"}\n";
+        for (input_name, expected_output_name) in [
+            ("scan.jsonl", "scan.html"),
+            ("custom.log", "custom.html"),
+            ("extensionless", "extensionless.html"),
+            ("already.html", "already.html.html"),
+            ("uppercase.HTML", "uppercase.HTML.html"),
+        ] {
+            let input = directory.join(input_name);
+            std::fs::write(&input, jsonl).unwrap();
+            let output = generate_report(input.to_str().unwrap(), &config, "test").unwrap();
+            assert_eq!(Path::new(&output), directory.join(expected_output_name));
+            assert_eq!(std::fs::read_to_string(&input).unwrap(), jsonl);
+            assert!(std::fs::read_to_string(&output)
+                .unwrap()
+                .contains("<!DOCTYPE html>"));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn test_html_escape() {
         assert_eq!(html_escape("<script>"), "&lt;script&gt;");
         assert_eq!(html_escape("a & b"), "a &amp; b");
         assert_eq!(html_escape(r#"say "hello""#), "say &quot;hello&quot;");
     }
-    
+
     #[test]
     fn test_format_size() {
         // Note: format_size uses decimal units (1000-based), not binary (1024-based)
@@ -2218,7 +2406,7 @@ mod tests {
         assert_eq!(format_size(1_000_000_000), "1.0 GB");
         assert_eq!(format_size(1_500_000_000), "1.5 GB");
     }
-    
+
     #[test]
     fn test_truncate_string() {
         assert_eq!(truncate_string("hello", 10), "hello");
@@ -2244,5 +2432,24 @@ mod tests {
         assert!(result.contains("&lt;script"));
         assert!(!result.contains("<script language"));
     }
-}
 
+    #[test]
+    fn test_file_scan_warning_is_reported_as_finding() {
+        let path = std::env::temp_dir().join(format!(
+            "loki-file-scan-warning-{}.jsonl",
+            std::process::id()
+        ));
+        let jsonl = r#"{"timestamp":"2026-06-18T09:09:29Z","level":"WARNING","event_type":"file_scan_warning","hostname":"host","message":"YARA scan timeout while scanning FILE: sample.bin - skipping and continuing","file_path":"sample.bin","score":0.0,"file_type":"ARBITRARY BINARY DATA","file_size":1048576,"reasons":[{"message":"YARA scan timeout while scanning FILE: sample.bin - skipping and continuing","score":0}]}"#;
+
+        std::fs::write(&path, jsonl).expect("write jsonl fixture");
+        let report_data = parse_jsonl(path.to_str().expect("temp path is valid UTF-8"))
+            .expect("parse jsonl fixture");
+        let html = render_findings(&report_data.findings);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(report_data.findings.len(), 1);
+        assert!(html.contains("File Scan Warning"));
+        assert!(html.contains("YARA scan timeout"));
+        assert!(!html.contains("No Findings"));
+    }
+}

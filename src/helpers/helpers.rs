@@ -1,43 +1,56 @@
+use crate::helpers::unified_logger::UnifiedLogger;
+use human_bytes::human_bytes;
 use std::env;
 #[cfg(not(all(windows, target_arch = "aarch64")))]
 use std::net::IpAddr;
-use human_bytes::human_bytes;
-use sysinfo::{System, Disks};
-use crate::helpers::unified_logger::UnifiedLogger;
+use sysinfo::{Disks, System};
 
 // Evaluate platform & environment information
 pub fn evaluate_env(logger: &UnifiedLogger) {
     let mut sys = System::new_all();
     sys.refresh_all();
-    // Command line arguments 
+    // Command line arguments
     let args: Vec<String> = env::args().collect();
     logger.info(&format!("Command line flags FLAGS: {:?}", args));
     // OS
-    logger.info(&format!("Operating system information OS: {} ARCH: {}", env::consts::OS, env::consts::ARCH));
+    logger.info(&format!(
+        "Operating system information OS: {} ARCH: {}",
+        env::consts::OS,
+        env::consts::ARCH
+    ));
     // System Names
     logger.info("System information (detailed system info requires sysinfo API update)");
     // CPU
     let cpus = sys.cpus();
     if !cpus.is_empty() {
-        logger.info(&format!("CPU information NUM_CORES: {} FREQUENCY: {} MHz VENDOR: {:?}", 
-        cpus.len(), cpus[0].frequency(), cpus[0].vendor_id()));
+        logger.info(&format!(
+            "CPU information NUM_CORES: {} FREQUENCY: {} MHz VENDOR: {:?}",
+            cpus.len(),
+            cpus[0].frequency(),
+            cpus[0].vendor_id()
+        ));
     }
     // Memory
-    logger.info(&format!("Memory information TOTAL: {} USED: {} FREE: {}", 
-        human_bytes(sys.total_memory() as f64), 
+    logger.info(&format!(
+        "Memory information TOTAL: {} USED: {} FREE: {}",
+        human_bytes(sys.total_memory() as f64),
         human_bytes(sys.used_memory() as f64),
-        human_bytes((sys.total_memory() - sys.used_memory()) as f64)));
-    
+        human_bytes((sys.total_memory() - sys.used_memory()) as f64)
+    ));
+
     // Network interfaces and IP addresses
     let ip_addresses = collect_ip_addresses();
-    
+
     if ip_addresses.is_empty() {
         // Fallback: just list the interfaces without IPs
         logger.info("Network interfaces (no IP addresses detected)");
     } else {
-        logger.info(&format!("Network interfaces IPs: {}", ip_addresses.join(", ")));
+        logger.info(&format!(
+            "Network interfaces IPs: {}",
+            ip_addresses.join(", ")
+        ));
     }
-    
+
     // Hard disks
     let disks = Disks::new_with_refreshed_list();
     for disk in disks.list() {
@@ -47,12 +60,12 @@ pub fn evaluate_env(logger: &UnifiedLogger) {
         } else {
             0.0
         };
-        
+
         logger.info(&format!(
-            "Hard disk NAME: {:?} FS: {:?} MOUNT: {:?} USED: {} / {} ({:.1}%)", 
-            disk.name().to_string_lossy(), 
-            disk.file_system().to_string_lossy(), 
-            disk.mount_point().to_string_lossy(), 
+            "Hard disk NAME: {:?} FS: {:?} MOUNT: {:?} USED: {} / {} ({:.1}%)",
+            disk.name().to_string_lossy(),
+            disk.file_system().to_string_lossy(),
+            disk.mount_point().to_string_lossy(),
             human_bytes(used_space as f64),
             human_bytes(disk.total_space() as f64),
             usage_percent,
@@ -65,7 +78,7 @@ fn collect_ip_addresses() -> Vec<String> {
     // Note: We use get_if_addrs directly as sysinfo::Networks uses different interface
     // naming conventions on Windows, causing cross-library name matching to fail
     let mut ip_addresses: Vec<String> = Vec::new();
-    
+
     if let Ok(interfaces) = get_if_addrs::get_if_addrs() {
         for iface in interfaces {
             let ip = iface.addr.ip();
@@ -73,13 +86,13 @@ fn collect_ip_addresses() -> Vec<String> {
             if ip.is_loopback() {
                 continue;
             }
-            
+
             // Skip common virtual interface prefixes
             let name_lower = iface.name.to_lowercase();
             if name_lower.contains("loopback") || name_lower == "lo" {
                 continue;
             }
-            
+
             let ip_str = match ip {
                 IpAddr::V4(v4) => format!("{}: {} (IPv4)", iface.name, v4),
                 IpAddr::V6(v6) => format!("{}: {} (IPv6)", iface.name, v6),
@@ -89,7 +102,7 @@ fn collect_ip_addresses() -> Vec<String> {
             }
         }
     }
-    
+
     ip_addresses
 }
 
@@ -106,7 +119,7 @@ pub fn get_hostname() -> String {
             return hostname;
         }
     }
-    
+
     // Fallback to environment variables
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -125,7 +138,9 @@ pub fn is_elevated() -> bool {
 #[cfg(windows)]
 pub fn is_elevated() -> bool {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
@@ -157,15 +172,18 @@ pub fn is_elevated() -> bool {
 #[allow(dead_code)]
 pub fn parse_size_string(size_str: &str) -> Result<usize, String> {
     let s = size_str.trim().to_uppercase();
-    
+
     // Try parsing as raw number first
     if let Ok(num) = s.parse::<usize>() {
         return Ok(num);
     }
-    
+
     // Check suffixes
     let (num_str, multiplier) = if s.ends_with("GB") || s.ends_with("G") {
-        (s.trim_end_matches("GB").trim_end_matches('G'), 1024 * 1024 * 1024)
+        (
+            s.trim_end_matches("GB").trim_end_matches('G'),
+            1024 * 1024 * 1024,
+        )
     } else if s.ends_with("MB") || s.ends_with("M") {
         (s.trim_end_matches("MB").trim_end_matches('M'), 1024 * 1024)
     } else if s.ends_with("KB") || s.ends_with("K") {
@@ -175,20 +193,33 @@ pub fn parse_size_string(size_str: &str) -> Result<usize, String> {
     } else {
         return Err(format!("Unknown size format: {}", s));
     };
-    
+
     // Parse the number part
-    let num = num_str.trim().parse::<usize>()
+    let num = num_str
+        .trim()
+        .parse::<usize>()
         .map_err(|_| format!("Invalid number format: {}", num_str))?;
-        
+
     Ok(num * multiplier)
 }
 
 // Helper for consistent error logging
-pub fn log_access_error(logger: &UnifiedLogger, path: &str, error: &dyn std::fmt::Debug, show_trace: bool) {
+pub fn log_access_error(
+    logger: &UnifiedLogger,
+    path: &str,
+    error: &dyn std::fmt::Debug,
+    show_trace: bool,
+) {
     if show_trace {
-        logger.error(&format!("Cannot access object PATH: {} ERROR: {:?}", path, error));
+        logger.error(&format!(
+            "Cannot access object PATH: {} ERROR: {:?}",
+            path, error
+        ));
     } else {
-        logger.debug(&format!("Cannot access object PATH: {} ERROR: {:?}", path, error));
+        logger.debug(&format!(
+            "Cannot access object PATH: {} ERROR: {:?}",
+            path, error
+        ));
     }
 }
 

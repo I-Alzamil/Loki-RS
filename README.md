@@ -24,6 +24,10 @@ A rewrite of [Loki](https://github.com/Neo23x0/Loki) in Rust. High-performance, 
 
 Process memory scanning on macOS is best-effort and typically requires debugging entitlements or elevated privileges. Without those, Loki-RS will still scan files but will not be able to read most process memory. Use `--no-procs` to skip process scanning if needed.
 
+## Linux process scanning
+
+On Linux, Loki-RS skips device-backed and kernel-special process mappings before reading `/proc/<pid>/mem`. This avoids known instability with some driver-managed VMAs while preserving normal anonymous, heap/stack, and regular file-backed memory scanning. If you still hit environment-specific issues, use `--no-procs` to disable process scanning.
+
 ## Installation
 
 Download the pre-compiled binary for your platform from the [Releases Page](https://github.com/Neo23x0/Loki-RS/releases).
@@ -85,7 +89,7 @@ sudo ./loki --remote syslog-host.internal:514 --remote-proto udp
 ### Scan Target
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-f, --folder <PATH>` | `/` | Folder to scan |
+| `-f, --folder <PATH>` | `/` | Folder to scan. Quote paths containing spaces, e.g. `-f "J:\SteamLibrary\steamapps\common\SpaceCraft beta"` |
 
 ### Scan Control
 | Option | Default | Description |
@@ -117,6 +121,7 @@ sudo ./loki --remote syslog-host.internal:514 --remote-proto udp
 | `--notice-level <SCORE>` | `40` | Score threshold for NOTICE |
 | `--max-reasons <NUM>` | `2` | Max match reasons to display per finding |
 | `-m, --max-file-size <BYTES>` | `64000000` | Maximum file size to scan (64MB) |
+| `--yara-timeout <SECONDS>` | `10` | YARA scan timeout per file/process |
 | `-c, --cpu-limit <PERCENT>` | `100` | CPU utilization limit (1-100) |
 | `--threads <NUM>` | `-2` | Number of threads (0=all, -1=all-1, -2=all-2) |
 
