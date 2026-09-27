@@ -34,8 +34,11 @@ jobs:
           restore-keys: |
             ubuntu-cargo-test-
 
+      - name: Run unit tests
+        run: cargo test --locked -- --test-threads=1
+
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Setup test environment
         run: |
@@ -95,6 +98,9 @@ jobs:
         run: |
           chmod +x tests/run_all_tests.sh
           ./tests/run_all_tests.sh
+
+      - name: Run HTML report tests
+        run: bash tests/loki_util_html_tests.sh
 
   build:
     name: Build ${{ matrix.target }}
@@ -182,7 +188,7 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Strip binary (Linux/macOS)
         if: runner.os != 'Windows'
@@ -264,7 +270,7 @@ jobs:
           "CHECKSUM_FILE=$env:ARCHIVE_NAME.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: |
@@ -283,7 +289,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -295,7 +301,7 @@ jobs:
           echo "Tag version: ${VERSION}"
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: Release ${{ steps.version.outputs.VERSION }}
           body: |

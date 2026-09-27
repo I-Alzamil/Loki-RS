@@ -169,4 +169,135 @@ mod tests {
             assert!(t.borrow().work_start.is_some());
         });
     }
+
+    // =========================================================================
+    // Additional Resource Constraint Tests (Module 6 extension)
+    // =========================================================================
+
+    #[test]
+    fn test_calculate_sleep_ns_25_percent() {
+        let throttler = CpuThrottler::new(25);
+        let sleep_ns = throttler.calculate_sleep_ns(10_000_000);
+        // At 25% target: sleep = work * (100-25)/25 = work * 75/25 = work * 3
+        assert_eq!(sleep_ns, 30_000_000);
+    }
+
+    #[test]
+    fn test_calculate_sleep_ns_75_percent() {
+        let throttler = CpuThrottler::new(75);
+        let sleep_ns = throttler.calculate_sleep_ns(30_000_000);
+        // At 75% target: sleep = work * (100-75)/75 = work * 25/75 = work * 1/3
+        assert_eq!(sleep_ns, 10_000_000);
+    }
+
+    #[test]
+    fn test_calculate_sleep_ns_1_percent() {
+        let throttler = CpuThrottler::new(1);
+        let sleep_ns = throttler.calculate_sleep_ns(1_000_000);
+        // At 1% target: sleep = work * (100-1)/1 = work * 99
+        assert_eq!(sleep_ns, 99_000_000);
+    }
+
+    #[test]
+    fn test_100_percent_does_no_sleeping() {
+        let mut throttler = CpuThrottler::new(100);
+        
+        // Record start time
+        let start = Instant::now();
+        
+        // Simulate work
+        throttler.start_work();
+        // Do some minimal work
+        let _ = (0..1000).sum::<i32>();
+        throttler.end_work_and_throttle();
+        
+        // Should complete almost immediately (no sleep at 100%)
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_millis() < 50, "100% should not sleep, took {}ms", elapsed.as_millis());
+    }
+
+    #[test]
+    fn test_very_low_target_calculates_large_sleep() {
+        // Test that 1% target results in sleeping 99x the work time
+        let throttler = CpuThrottler::new(1);
+        
+        // 10ms of work
+        let work_ns: u64 = 10_000_000;
+        let sleep_ns = throttler.calculate_sleep_ns(work_ns);
+        
+        // At 1%, sleep should be 99x work = 990ms
+        assert_eq!(sleep_ns, 990_000_000);
+        
+        // Verify the ratio
+        let ratio = sleep_ns as f64 / work_ns as f64;
+        assert!((ratio - 99.0).abs() < 0.001, "Sleep ratio should be 99x at 1% target");
+    }
+
+    #[test]
+    fn test_target_percent_values() {
+        // Test boundary values
+        let cases = vec![
+            (1, 1),    // Minimum
+            (50, 50),  // Middle
+            (100, 100), // Maximum
+        ];
+
+        for (input, expected) in cases {
+            let throttler = CpuThrottler::new(input);
+            assert_eq!(throttler.target_percent, expected);
+        }
+    }
+
+    #[test]
+    fn test_zero_work_ns() {
+        let throttler = CpuThrottler::new(50);
+        let sleep_ns = throttler.calculate_sleep_ns(0);
+        assert_eq!(sleep_ns, 0, "Zero work should result in zero sleep");
+    }
+
+    #[test]
+    fn test_accumulated_work_below_threshold() {
+        // Test that small work chunks don't trigger immediate sleeping
+        let mut throttler = CpuThrottler::new(50);
+        
+        // Record initial accumulated work
+        let initial_accumulated = throttler.accumulated_work_ns;
+        
+        throttler.start_work();
+        // Very short "work" - below the 10ms batch threshold
+        throttler.end_work_and_throttle();
+        
+        // Work should be accumulated but not necessarily trigger sleep yet
+        // (depends on actual elapsed time being below min_batch_ns)
+        // Just verify no panic and state is valid
+        assert!(throttler.accumulated_work_ns >= initial_accumulated);
+    }
+
+    #[test]
+    fn test_dynamic_target_adjustment() {
+        let mut throttler = CpuThrottler::new(100);
+        assert_eq!(throttler.target_percent, 100);
+
+        // Dynamically reduce to 50%
+        throttler.set_target(50);
+        assert_eq!(throttler.target_percent, 50);
+
+        // Sleep calculation should now reflect new target
+        let sleep_ns = throttler.calculate_sleep_ns(10_000_000);
+        assert_eq!(sleep_ns, 10_000_000); // 50% = equal work and sleep
+    }
+
+    #[test]
+    fn test_throttle_end_with_limit() {
+        // Test the throttle_end_with_limit function
+        init_thread_throttler(100);
+        
+        throttle_start();
+        throttle_end_with_limit(50);
+        
+        // Verify the target was updated
+        THROTTLER.with(|t| {
+            assert_eq!(t.borrow().target_percent, 50);
+        });
+    }
 }

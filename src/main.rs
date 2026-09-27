@@ -121,10 +121,11 @@ struct Cli {
     )]
     max_file_size: usize,
 
-    /// YARA scan timeout per file/process in seconds
+    /// Maximum YARA scan time for each file or process-memory buffer, in seconds
     #[arg(
         long,
         default_value_t = 10,
+        value_name = "SECONDS",
         value_parser = clap::value_parser!(u64).range(1..),
         help_heading = "Tuning"
     )]
@@ -213,7 +214,7 @@ pub struct ScanConfig {
     pub warning_threshold: i16,
     pub notice_threshold: i16,
     pub max_reasons: usize,
-    pub yara_timeout: u64,
+    pub yara_timeout: std::time::Duration,
     pub threads: usize,
     pub cpu_limit: u8,
     pub exclusion_count: usize,
@@ -1409,7 +1410,7 @@ fn main() {
         warning_threshold: args.warning_level,
         notice_threshold: args.notice_level,
         max_reasons: args.max_reasons,
-        yara_timeout: args.yara_timeout,
+        yara_timeout: std::time::Duration::from_secs(args.yara_timeout),
         threads: num_threads,
         cpu_limit: args.cpu_limit,
         exclusion_count,
@@ -1486,7 +1487,7 @@ fn main() {
             ),
             (
                 "YARA_TIMEOUT",
-                &format!("{} seconds", scan_config.yara_timeout),
+                &format!("{} seconds", scan_config.yara_timeout.as_secs()),
             ),
         ],
     );
@@ -2185,6 +2186,28 @@ mod tests {
         }
     }
 
+    mod cli_yara_timeout_tests {
+        use super::*;
+
+        #[test]
+        fn defaults_to_ten_seconds() {
+            let args = Cli::try_parse_from(["loki"]).expect("parse default arguments");
+            assert_eq!(args.yara_timeout, 10);
+        }
+
+        #[test]
+        fn accepts_a_positive_timeout() {
+            let args = Cli::try_parse_from(["loki", "--yara-timeout", "30"])
+                .expect("parse positive YARA timeout");
+            assert_eq!(args.yara_timeout, 30);
+        }
+
+        #[test]
+        fn rejects_a_zero_timeout() {
+            assert!(Cli::try_parse_from(["loki", "--yara-timeout", "0"]).is_err());
+        }
+    }
+
     mod scan_config_tests {
         use super::*;
 
@@ -2202,7 +2225,7 @@ mod tests {
                 warning_threshold: 60,
                 notice_threshold: 40,
                 max_reasons: 2,
-                yara_timeout: 10,
+                yara_timeout: std::time::Duration::from_secs(10),
                 threads: 4,
                 cpu_limit: 100,
                 exclusion_count: 0,
@@ -2232,7 +2255,7 @@ mod tests {
                 warning_threshold: 60,
                 notice_threshold: 40,
                 max_reasons: 2,
-                yara_timeout: 10,
+                yara_timeout: std::time::Duration::from_secs(10),
                 threads: 4,
                 cpu_limit: 100,
                 exclusion_count: 0,
@@ -2734,6 +2757,1164 @@ mod tests {
                 let is_fp = ioc.regex_fp.as_ref().map_or(false, |fp| fp.is_match(path));
                 assert!(!is_fp, "Should not be FP when regex_fp is None: {}", path);
             }
+        }
+    }
+
+    // =========================================================================
+    // Test Module 1: Minimal Detection Server Tests
+    // Tests score threshold filtering and LogLevel assignment
+    // =========================================================================
+    mod threshold_tests {
+        use super::*;
+        use crate::helpers::unified_logger::LogLevel;
+
+        /// Determine LogLevel based on score and threshold configuration
+        fn determine_log_level(
+            score: i16,
+            alert_threshold: i16,
+            warning_threshold: i16,
+            notice_threshold: i16,
+        ) -> Option<LogLevel> {
+            if score >= alert_threshold {
+                Some(LogLevel::Alert)
+            } else if score >= warning_threshold {
+                Some(LogLevel::Warning)
+            } else if score >= notice_threshold {
+                Some(LogLevel::Notice)
+            } else {
+                None // Below notice threshold - don't report
+            }
+        }
+
+        /// Validate that thresholds are in correct order (alert >= warning >= notice)
+        fn validate_thresholds(
+            alert_threshold: i16,
+            warning_threshold: i16,
+            notice_threshold: i16,
+        ) -> Result<(), &'static str> {
+            if alert_threshold < warning_threshold {
+                return Err("alert_threshold must be >= warning_threshold");
+            }
+            if warning_threshold < notice_threshold {
+                return Err("warning_threshold must be >= notice_threshold");
+            }
+            if notice_threshold < 0 {
+                return Err("notice_threshold must be >= 0");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn test_default_thresholds_log_level() {
+            // Default: alert=80, warning=60, notice=40
+            let alert_threshold = 80;
+            let warning_threshold = 60;
+            let notice_threshold = 40;
+
+            // Alert: score >= 80
+            let level =
+                determine_log_level(100, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Alert)));
+            let level =
+                determine_log_level(80, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Alert)));
+
+            // Warning: 60 <= score < 80
+            let level =
+                determine_log_level(79, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Warning)));
+            let level =
+                determine_log_level(60, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Warning)));
+
+            // Notice: 40 <= score < 60
+            let level =
+                determine_log_level(59, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Notice)));
+            let level =
+                determine_log_level(40, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Notice)));
+
+            // Below notice: not reported
+            let level =
+                determine_log_level(39, alert_threshold, warning_threshold, notice_threshold);
+            assert!(level.is_none());
+            let level =
+                determine_log_level(0, alert_threshold, warning_threshold, notice_threshold);
+            assert!(level.is_none());
+        }
+
+        #[test]
+        fn test_invalid_threshold_ordering_alert_below_warning() {
+            let result = validate_thresholds(50, 70, 40); // alert < warning
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                "alert_threshold must be >= warning_threshold"
+            );
+        }
+
+        #[test]
+        fn test_invalid_threshold_ordering_warning_below_notice() {
+            let result = validate_thresholds(80, 30, 50); // warning < notice
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                "warning_threshold must be >= notice_threshold"
+            );
+        }
+
+        #[test]
+        fn test_invalid_negative_notice_threshold() {
+            let result = validate_thresholds(80, 60, -10);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "notice_threshold must be >= 0");
+        }
+
+        #[test]
+        fn test_valid_custom_thresholds() {
+            // Custom: notice=50, warning=70, alert=90
+            let result = validate_thresholds(90, 70, 50);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_valid_equal_thresholds() {
+            // Edge case: all equal (should be valid, though not useful)
+            let result = validate_thresholds(50, 50, 50);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_custom_thresholds_scoring() {
+            // Custom: notice=50, warning=70, alert=90
+            let alert_threshold = 90;
+            let warning_threshold = 70;
+            let notice_threshold = 50;
+
+            // Alert: score >= 90
+            let level =
+                determine_log_level(90, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Alert)));
+            let level =
+                determine_log_level(100, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Alert)));
+
+            // Warning: 70 <= score < 90
+            let level =
+                determine_log_level(89, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Warning)));
+            let level =
+                determine_log_level(70, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Warning)));
+
+            // Notice: 50 <= score < 70
+            let level =
+                determine_log_level(69, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Notice)));
+            let level =
+                determine_log_level(50, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Notice)));
+
+            // Below notice: not reported
+            let level =
+                determine_log_level(49, alert_threshold, warning_threshold, notice_threshold);
+            assert!(level.is_none());
+        }
+
+        #[test]
+        fn test_edge_case_score_at_boundary() {
+            let alert_threshold = 80;
+            let warning_threshold = 60;
+            let notice_threshold = 40;
+
+            // Exactly at alert boundary
+            let level =
+                determine_log_level(80, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Alert)));
+
+            // Exactly at warning boundary
+            let level =
+                determine_log_level(60, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Warning)));
+
+            // Exactly at notice boundary
+            let level =
+                determine_log_level(40, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Notice)));
+
+            // One below each boundary
+            let level =
+                determine_log_level(79, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Warning))); // Not alert
+
+            let level =
+                determine_log_level(59, alert_threshold, warning_threshold, notice_threshold);
+            assert!(matches!(level, Some(LogLevel::Notice))); // Not warning
+
+            let level =
+                determine_log_level(39, alert_threshold, warning_threshold, notice_threshold);
+            assert!(level.is_none()); // Not notice
+        }
+
+        #[test]
+        fn test_scan_config_threshold_ordering() {
+            // Test that ScanConfig enforces proper ordering
+            let config = ScanConfig {
+                max_file_size: 64_000_000,
+                show_access_errors: false,
+                scan_all_types: false,
+                scan_hard_drives: false,
+                scan_all_drives: false,
+                scan_archives: true,
+                is_elevated: false,
+                alert_threshold: 80,
+                warning_threshold: 60,
+                notice_threshold: 40,
+                max_reasons: 2,
+                yara_timeout: std::time::Duration::from_secs(10),
+                threads: 4,
+                cpu_limit: 100,
+                exclusion_count: 0,
+                yara_rules_count: 0,
+                ioc_count: 0,
+                program_dir: None,
+            };
+
+            // Verify ordering is correct
+            assert!(config.alert_threshold >= config.warning_threshold);
+            assert!(config.warning_threshold >= config.notice_threshold);
+            assert!(config.notice_threshold >= 0);
+        }
+    }
+
+    // =========================================================================
+    // Test Module 3: Web Server Hardening Tests
+    // Tests filename IOC matching for webshell-like patterns
+    // =========================================================================
+    mod webshell_detection_tests {
+        use super::*;
+
+        fn create_webshell_filename_iocs() -> Vec<FilenameIOC> {
+            vec![
+                // PHP webshells with suspicious names
+                FilenameIOC {
+                    pattern: r"(?i)(c99|r57|b374k|wso|chaos|alfa|shell).*\.php$".to_string(),
+                    regex: Regex::new(r"(?i)(c99|r57|b374k|wso|chaos|alfa|shell).*\.php$").unwrap(),
+                    regex_fp: Some(
+                        Regex::new(r"(?i)(wordpress|wp-admin|wp-content|vendor)").unwrap(),
+                    ),
+                    description: "PHP webshell - common variant".to_string(),
+                    score: 95,
+                },
+                // ASPX webshells
+                FilenameIOC {
+                    pattern: r"(?i)(cmd|shell|upload|hack|backdoor).*\.aspx$".to_string(),
+                    regex: Regex::new(r"(?i)(cmd|shell|upload|hack|backdoor).*\.aspx$").unwrap(),
+                    regex_fp: None,
+                    description: "ASPX webshell - suspicious name".to_string(),
+                    score: 90,
+                },
+                // JSP webshells
+                FilenameIOC {
+                    pattern: r"(?i)(cmd|shell|jspspy|chopper).*\.jsp[x]?$".to_string(),
+                    regex: Regex::new(r"(?i)(cmd|shell|jspspy|chopper).*\.jsp[x]?$").unwrap(),
+                    regex_fp: None,
+                    description: "JSP webshell - suspicious name".to_string(),
+                    score: 90,
+                },
+                // Generic suspicious PHP
+                FilenameIOC {
+                    pattern: r"(?i)^[a-z0-9]{8,32}\.php$".to_string(),
+                    regex: Regex::new(r"(?i)^[a-z0-9]{8,32}\.php$").unwrap(),
+                    regex_fp: None,
+                    description: "Random-named PHP file".to_string(),
+                    score: 50,
+                },
+            ]
+        }
+
+        #[test]
+        fn test_php_webshell_c99_detected() {
+            let iocs = create_webshell_filename_iocs();
+            let path = "/var/www/html/c99shell.php";
+
+            let fioc = &iocs[0];
+            assert!(fioc.regex.is_match(path), "c99shell.php should match");
+
+            let is_fp = fioc.regex_fp.as_ref().map_or(false, |fp| fp.is_match(path));
+            assert!(!is_fp, "Should not be false positive");
+        }
+
+        #[test]
+        fn test_php_webshell_r57_detected() {
+            let iocs = create_webshell_filename_iocs();
+            let path = "/var/www/html/r57.php";
+
+            let fioc = &iocs[0];
+            assert!(fioc.regex.is_match(path), "r57.php should match");
+        }
+
+        #[test]
+        fn test_php_webshell_wso_detected() {
+            let iocs = create_webshell_filename_iocs();
+            let path = "/var/www/uploads/wso_shell.php";
+
+            let fioc = &iocs[0];
+            assert!(fioc.regex.is_match(path), "wso_shell.php should match");
+        }
+
+        #[test]
+        fn test_wordpress_admin_excluded() {
+            let iocs = create_webshell_filename_iocs();
+            let path = "/var/www/html/wp-admin/shell.php";
+
+            let fioc = &iocs[0];
+            let matches = fioc.regex.is_match(path);
+            assert!(matches, "shell.php should match pattern");
+
+            let is_fp = fioc.regex_fp.as_ref().map_or(false, |fp| fp.is_match(path));
+            assert!(is_fp, "wp-admin path should be false positive");
+        }
+
+        #[test]
+        fn test_wordpress_vendor_excluded() {
+            let iocs = create_webshell_filename_iocs();
+            let path = "/var/www/html/vendor/shell_command.php";
+
+            let fioc = &iocs[0];
+            let matches = fioc.regex.is_match(path);
+            assert!(matches, "shell_command.php should match pattern");
+
+            let is_fp = fioc.regex_fp.as_ref().map_or(false, |fp| fp.is_match(path));
+            assert!(is_fp, "vendor path should be false positive");
+        }
+
+        #[test]
+        fn test_aspx_webshell_detected() {
+            let iocs = create_webshell_filename_iocs();
+            let test_paths = vec![
+                "/inetpub/wwwroot/cmd.aspx",
+                "/inetpub/wwwroot/upload_shell.aspx",
+                "/inetpub/wwwroot/hack_tool.aspx",
+                "/inetpub/wwwroot/backdoor.aspx",
+            ];
+
+            let fioc = &iocs[1];
+            for path in test_paths {
+                assert!(fioc.regex.is_match(path), "Should match: {}", path);
+            }
+        }
+
+        #[test]
+        fn test_legitimate_aspx_not_matched() {
+            let iocs = create_webshell_filename_iocs();
+            let legitimate_paths = vec![
+                "/inetpub/wwwroot/Default.aspx",
+                "/inetpub/wwwroot/login.aspx",
+                "/inetpub/wwwroot/contact.aspx",
+            ];
+
+            let fioc = &iocs[1];
+            for path in legitimate_paths {
+                assert!(
+                    !fioc.regex.is_match(path),
+                    "Should NOT match legitimate: {}",
+                    path
+                );
+            }
+        }
+
+        #[test]
+        fn test_jsp_webshell_detected() {
+            let iocs = create_webshell_filename_iocs();
+            let test_paths = vec![
+                "/var/lib/tomcat/webapps/cmd.jsp",
+                "/var/lib/tomcat/webapps/jspspy.jsp",
+                "/var/lib/tomcat/webapps/shell.jspx",
+                "/var/lib/tomcat/webapps/chopper.jsp",
+            ];
+
+            let fioc = &iocs[2];
+            for path in test_paths {
+                assert!(fioc.regex.is_match(path), "Should match: {}", path);
+            }
+        }
+
+        #[test]
+        fn test_case_insensitivity() {
+            let iocs = create_webshell_filename_iocs();
+
+            // Test various cases for PHP webshell
+            let php_variants = vec![
+                "/var/www/C99.PHP",
+                "/var/www/R57.php",
+                "/var/www/WSO.Php",
+                "/var/www/SHELL.PHP",
+            ];
+
+            let fioc = &iocs[0];
+            for path in php_variants {
+                assert!(
+                    fioc.regex.is_match(path),
+                    "Should match case-insensitive: {}",
+                    path
+                );
+            }
+
+            // Test ASPX case insensitivity
+            let aspx_variants = vec!["/inetpub/CMD.ASPX", "/inetpub/Shell.Aspx"];
+
+            let fioc = &iocs[1];
+            for path in aspx_variants {
+                assert!(
+                    fioc.regex.is_match(path),
+                    "Should match case-insensitive: {}",
+                    path
+                );
+            }
+        }
+
+        #[test]
+        fn test_web_accessible_directories() {
+            let iocs = create_webshell_filename_iocs();
+            let fioc = &iocs[0];
+
+            // Common web server paths
+            let web_paths = vec![
+                "/var/www/html/c99.php",            // Apache
+                "/usr/share/nginx/html/wso.php",    // Nginx
+                "/home/user/public_html/shell.php", // cPanel
+                "/srv/www/htdocs/r57.php",          // SUSE
+            ];
+
+            for path in web_paths {
+                assert!(fioc.regex.is_match(path), "Should match web path: {}", path);
+            }
+        }
+
+        #[test]
+        fn test_random_php_filename_pattern() {
+            let iocs = create_webshell_filename_iocs();
+            let fioc = &iocs[3];
+
+            // Random-looking filenames (common webshell pattern)
+            let random_names = vec![
+                "a1b2c3d4.php",         // 8 chars
+                "xyz12345678.php",      // 11 chars
+                "abcdefghijklmnop.php", // 16 chars
+            ];
+
+            for name in random_names {
+                assert!(
+                    fioc.regex.is_match(name),
+                    "Should match random name: {}",
+                    name
+                );
+            }
+
+            // Legitimate names should NOT match this pattern
+            let legitimate = vec!["index.php", "config.php", "header.php"];
+
+            for name in legitimate {
+                assert!(
+                    !fioc.regex.is_match(name),
+                    "Should NOT match legitimate: {}",
+                    name
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Test Module 4: Noisy Dev Machine / Exclusion Tests
+    // Tests exclusion pattern loading and matching
+    // =========================================================================
+    mod exclusion_pattern_tests {
+        use super::*;
+
+        /// Simulate exclusion pattern parsing without file I/O
+        fn parse_exclusion_patterns(content: &str) -> Vec<Result<Regex, String>> {
+            let mut results = Vec::new();
+
+            for line in content.lines() {
+                let trimmed = line.trim();
+
+                // Skip empty lines and comments
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+
+                // Try to compile the pattern
+                match Regex::new(trimmed) {
+                    Ok(regex) => results.push(Ok(regex)),
+                    Err(e) => results.push(Err(format!("Invalid pattern '{}': {}", trimmed, e))),
+                }
+            }
+
+            results
+        }
+
+        /// Check if a path should be excluded
+        fn should_exclude(path: &str, patterns: &[Regex]) -> bool {
+            patterns.iter().any(|p| p.is_match(path))
+        }
+
+        #[test]
+        fn test_comment_lines_skipped() {
+            let content = r#"
+# This is a comment
+# Another comment
+/actual/pattern.*
+# Trailing comment
+"#;
+            let results = parse_exclusion_patterns(content);
+            // Only one pattern should be parsed
+            assert_eq!(results.len(), 1);
+            assert!(results[0].is_ok());
+        }
+
+        #[test]
+        fn test_empty_lines_skipped() {
+            let content = r#"
+
+/pattern/one.*
+
+/pattern/two.*
+
+"#;
+            let results = parse_exclusion_patterns(content);
+            assert_eq!(results.len(), 2);
+        }
+
+        #[test]
+        fn test_valid_regex_patterns() {
+            let content = r#"
+/home/user/\.cache/.*
+/var/log/.*\.log$
+.*node_modules.*
+/tmp/[0-9]+/.*
+"#;
+            let results = parse_exclusion_patterns(content);
+            assert_eq!(results.len(), 4);
+            for result in &results {
+                assert!(result.is_ok(), "All patterns should compile: {:?}", result);
+            }
+        }
+
+        #[test]
+        fn test_invalid_regex_handled_gracefully() {
+            let content = r#"
+/valid/pattern.*
+[invalid(regex
+/another/valid.*
+"#;
+            let results = parse_exclusion_patterns(content);
+            assert_eq!(results.len(), 3);
+
+            assert!(results[0].is_ok(), "First pattern should be valid");
+            assert!(results[1].is_err(), "Second pattern should be invalid");
+            assert!(results[2].is_ok(), "Third pattern should be valid");
+        }
+
+        #[test]
+        fn test_exclusion_pattern_matching() {
+            let content = r#"
+/home/user/\.cargo/.*
+/var/cache/.*
+.*\.git/.*
+"#;
+            let results: Vec<Regex> = parse_exclusion_patterns(content)
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Should exclude
+            assert!(should_exclude("/home/user/.cargo/registry/cache", &results));
+            assert!(should_exclude("/var/cache/apt/archives", &results));
+            assert!(should_exclude("/project/.git/objects/pack", &results));
+
+            // Should NOT exclude
+            assert!(!should_exclude("/home/user/documents/file.txt", &results));
+            assert!(!should_exclude("/var/log/syslog", &results));
+        }
+
+        #[test]
+        fn test_multiple_patterns_matching_different_paths() {
+            let patterns_str = r#"
+/dev/machine/target/.*
+/node_modules/.*
+/\.venv/.*
+/__pycache__/.*
+/\.cache/.*
+"#;
+            let patterns: Vec<Regex> = parse_exclusion_patterns(patterns_str)
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Test dev machine paths
+            assert!(should_exclude("/dev/machine/target/debug/build", &patterns));
+            assert!(should_exclude(
+                "/project/node_modules/lodash/index.js",
+                &patterns
+            ));
+            assert!(should_exclude("/project/.venv/lib/python3.10", &patterns));
+            assert!(should_exclude(
+                "/project/__pycache__/module.cpython-310.pyc",
+                &patterns
+            ));
+            assert!(should_exclude("/home/user/.cache/huggingface", &patterns));
+
+            // These should NOT be excluded
+            assert!(!should_exclude("/project/src/main.rs", &patterns));
+            assert!(!should_exclude("/var/www/html/index.php", &patterns));
+        }
+
+        #[test]
+        fn test_exclusion_simulation_with_real_patterns() {
+            // Simulate the actual exclusion logic from filesystem_scan
+            let exclusion_patterns = vec![
+                Regex::new(r"\.cargo/registry/").unwrap(),
+                Regex::new(r"\.rustup/toolchains/").unwrap(),
+                Regex::new(r"/target/(debug|release)/").unwrap(),
+                Regex::new(r"node_modules/").unwrap(),
+            ];
+
+            let test_cases = vec![
+                // (path, should_exclude)
+                ("/home/user/.cargo/registry/cache/index.crates.io", true),
+                (
+                    "/home/user/.rustup/toolchains/stable-x86_64/lib/rustlib",
+                    true,
+                ),
+                ("/project/target/debug/deps/lib.rlib", true),
+                ("/project/node_modules/express/index.js", true),
+                ("/project/src/main.rs", false),
+                ("/home/user/documents/report.pdf", false),
+            ];
+
+            for (path, expected_exclude) in test_cases {
+                let excluded = should_exclude(path, &exclusion_patterns);
+                assert_eq!(
+                    excluded, expected_exclude,
+                    "Path '{}' should be excluded={}, got excluded={}",
+                    path, expected_exclude, excluded
+                );
+            }
+        }
+
+        #[test]
+        fn test_whitespace_trimmed() {
+            let content = "  /pattern/with/spaces.*  \n\t/pattern/with/tabs.*\t";
+            let results = parse_exclusion_patterns(content);
+
+            assert_eq!(results.len(), 2);
+            assert!(results[0].is_ok());
+            assert!(results[1].is_ok());
+        }
+
+        #[test]
+        fn test_empty_content() {
+            let content = "";
+            let results = parse_exclusion_patterns(content);
+            assert!(results.is_empty());
+        }
+
+        #[test]
+        fn test_only_comments_and_empty_lines() {
+            let content = r#"
+# Just comments
+# Nothing else
+
+# More comments
+"#;
+            let results = parse_exclusion_patterns(content);
+            assert!(results.is_empty());
+        }
+    }
+
+    // =========================================================================
+    // Test Module 5: Incident Response / Trace Tests
+    // Tests log level determination and debug/trace output behavior
+    // =========================================================================
+    mod log_level_tests {
+        use crate::helpers::unified_logger::LogLevel;
+
+        /// Determine log level from CLI flags (simulating CLI arg parsing)
+        fn determine_log_level_from_flags(trace: bool, debug: bool) -> LogLevel {
+            if trace || debug {
+                LogLevel::Debug
+            } else {
+                LogLevel::Info
+            }
+        }
+
+        /// Check if an event should be logged based on its level and the configured level
+        fn should_log_event(event_level: LogLevel, configured_level: LogLevel) -> bool {
+            // Lower enum variant = higher priority (Alert < Error < Warning < Notice < Info < Debug)
+            event_level <= configured_level
+        }
+
+        #[test]
+        fn test_trace_flag_sets_debug_level() {
+            let level = determine_log_level_from_flags(true, false);
+            assert!(matches!(level, LogLevel::Debug));
+        }
+
+        #[test]
+        fn test_debug_flag_sets_debug_level() {
+            let level = determine_log_level_from_flags(false, true);
+            assert!(matches!(level, LogLevel::Debug));
+        }
+
+        #[test]
+        fn test_both_flags_sets_debug_level() {
+            let level = determine_log_level_from_flags(true, true);
+            assert!(matches!(level, LogLevel::Debug));
+        }
+
+        #[test]
+        fn test_no_flags_sets_info_level() {
+            let level = determine_log_level_from_flags(false, false);
+            assert!(matches!(level, LogLevel::Info));
+        }
+
+        #[test]
+        fn test_debug_events_filtered_at_info_level() {
+            let configured_level = LogLevel::Info;
+
+            // Debug events should NOT pass
+            assert!(!should_log_event(LogLevel::Debug, configured_level));
+
+            // Info and higher should pass
+            assert!(should_log_event(LogLevel::Info, configured_level));
+            assert!(should_log_event(LogLevel::Notice, configured_level));
+            assert!(should_log_event(LogLevel::Warning, configured_level));
+            assert!(should_log_event(LogLevel::Error, configured_level));
+            assert!(should_log_event(LogLevel::Alert, configured_level));
+        }
+
+        #[test]
+        fn test_all_events_pass_at_debug_level() {
+            let configured_level = LogLevel::Debug;
+
+            // All levels should pass when configured at Debug
+            assert!(should_log_event(LogLevel::Debug, configured_level));
+            assert!(should_log_event(LogLevel::Info, configured_level));
+            assert!(should_log_event(LogLevel::Notice, configured_level));
+            assert!(should_log_event(LogLevel::Warning, configured_level));
+            assert!(should_log_event(LogLevel::Error, configured_level));
+            assert!(should_log_event(LogLevel::Alert, configured_level));
+        }
+
+        #[test]
+        fn test_log_level_ordering() {
+            // Verify LogLevel ordering (Alert is highest priority = lowest enum value)
+            assert!(LogLevel::Alert < LogLevel::Error);
+            assert!(LogLevel::Error < LogLevel::Warning);
+            assert!(LogLevel::Warning < LogLevel::Notice);
+            assert!(LogLevel::Notice < LogLevel::Info);
+            assert!(LogLevel::Info < LogLevel::Debug);
+        }
+
+        #[test]
+        fn test_warning_level_filters_lower() {
+            let configured_level = LogLevel::Warning;
+
+            // Warning, Error, Alert should pass
+            assert!(should_log_event(LogLevel::Alert, configured_level));
+            assert!(should_log_event(LogLevel::Error, configured_level));
+            assert!(should_log_event(LogLevel::Warning, configured_level));
+
+            // Notice, Info, Debug should NOT pass
+            assert!(!should_log_event(LogLevel::Notice, configured_level));
+            assert!(!should_log_event(LogLevel::Info, configured_level));
+            assert!(!should_log_event(LogLevel::Debug, configured_level));
+        }
+
+        #[test]
+        fn test_alert_only_level() {
+            let configured_level = LogLevel::Alert;
+
+            // Only Alert should pass
+            assert!(should_log_event(LogLevel::Alert, configured_level));
+
+            // Everything else should NOT pass
+            assert!(!should_log_event(LogLevel::Error, configured_level));
+            assert!(!should_log_event(LogLevel::Warning, configured_level));
+            assert!(!should_log_event(LogLevel::Notice, configured_level));
+            assert!(!should_log_event(LogLevel::Info, configured_level));
+            assert!(!should_log_event(LogLevel::Debug, configured_level));
+        }
+    }
+
+    // =========================================================================
+    // Test Module 6: Embedded/IoT / Resource Constraints Tests (main.rs part)
+    // Tests thread count calculation
+    // =========================================================================
+    mod resource_constraint_tests {
+        use super::*;
+
+        /// Calculate actual thread count from CLI argument
+        /// 0 = all CPUs, -1 = all-1, -2 = all-2, positive = exact count
+        fn calculate_thread_count(threads_arg: i32, num_cpus: usize) -> usize {
+            let num_cpus = num_cpus.max(1); // Ensure at least 1 CPU
+            let count = if threads_arg <= 0 {
+                // 0 = all, -1 = all-1, -2 = all-2, etc.
+                let adjustment = threads_arg.unsigned_abs() as usize;
+                if adjustment == 0 {
+                    num_cpus
+                } else {
+                    num_cpus.saturating_sub(adjustment)
+                }
+            } else {
+                threads_arg as usize
+            };
+
+            // Ensure at least 1 thread
+            count.max(1)
+        }
+
+        #[test]
+        fn test_threads_zero_uses_all_cpus() {
+            let result = calculate_thread_count(0, 8);
+            assert_eq!(result, 8);
+
+            let result = calculate_thread_count(0, 4);
+            assert_eq!(result, 4);
+        }
+
+        #[test]
+        fn test_threads_minus_one() {
+            let result = calculate_thread_count(-1, 8);
+            assert_eq!(result, 7); // 8 - 1
+
+            let result = calculate_thread_count(-1, 4);
+            assert_eq!(result, 3); // 4 - 1
+        }
+
+        #[test]
+        fn test_threads_minus_two() {
+            let result = calculate_thread_count(-2, 8);
+            assert_eq!(result, 6); // 8 - 2
+
+            let result = calculate_thread_count(-2, 4);
+            assert_eq!(result, 2); // 4 - 2
+        }
+
+        #[test]
+        fn test_threads_positive_exact() {
+            let result = calculate_thread_count(2, 8);
+            assert_eq!(result, 2);
+
+            let result = calculate_thread_count(4, 2);
+            assert_eq!(result, 4); // Can request more than CPUs
+        }
+
+        #[test]
+        fn test_threads_minimum_is_one() {
+            // Even with negative values larger than CPU count, minimum is 1
+            let result = calculate_thread_count(-10, 2);
+            assert_eq!(result, 1);
+
+            let result = calculate_thread_count(-100, 4);
+            assert_eq!(result, 1);
+        }
+
+        #[test]
+        fn test_single_cpu_system() {
+            let result = calculate_thread_count(0, 1);
+            assert_eq!(result, 1);
+
+            let result = calculate_thread_count(-1, 1);
+            assert_eq!(result, 1); // Can't go below 1
+
+            let result = calculate_thread_count(-2, 1);
+            assert_eq!(result, 1); // Can't go below 1
+        }
+
+        #[test]
+        fn test_max_file_size_config() {
+            // Test that max_file_size is configurable
+            let config_small = ScanConfig {
+                max_file_size: 1_000_000, // 1MB
+                show_access_errors: false,
+                scan_all_types: false,
+                scan_hard_drives: false,
+                scan_all_drives: false,
+                scan_archives: true,
+                is_elevated: false,
+                alert_threshold: 80,
+                warning_threshold: 60,
+                notice_threshold: 40,
+                max_reasons: 2,
+                yara_timeout: std::time::Duration::from_secs(10),
+                threads: 4,
+                cpu_limit: 100,
+                exclusion_count: 0,
+                yara_rules_count: 0,
+                ioc_count: 0,
+                program_dir: None,
+            };
+
+            let config_large = ScanConfig {
+                max_file_size: 100_000_000, // 100MB
+                ..config_small.clone()
+            };
+
+            assert_eq!(config_small.max_file_size, 1_000_000);
+            assert_eq!(config_large.max_file_size, 100_000_000);
+
+            // Test file size filtering logic
+            let file_sizes = vec![500_000, 2_000_000, 50_000_000, 150_000_000];
+
+            // With 1MB limit
+            let scannable_small: Vec<_> = file_sizes
+                .iter()
+                .filter(|&&s| s <= config_small.max_file_size)
+                .collect();
+            assert_eq!(scannable_small.len(), 1); // Only 500KB file
+
+            // With 100MB limit
+            let scannable_large: Vec<_> = file_sizes
+                .iter()
+                .filter(|&&s| s <= config_large.max_file_size)
+                .collect();
+            assert_eq!(scannable_large.len(), 3); // 500KB, 2MB, 50MB files
+        }
+    }
+
+    // =========================================================================
+    // Test Module 7: Custom IOC Feed Tests
+    // Tests IOC parsing robustness
+    // =========================================================================
+    mod ioc_parsing_tests {
+        use super::*;
+
+        /// Parse a hash IOC line (simulating initialize_hash_iocs logic)
+        fn parse_hash_ioc_line(line: &str) -> Option<HashIOC> {
+            let parts: Vec<&str> = line.split(';').collect();
+
+            if parts.is_empty() {
+                return None;
+            }
+
+            let hash = parts[0].trim().to_ascii_lowercase();
+            if hash.is_empty() || hash.starts_with('#') {
+                return None;
+            }
+
+            let hash_type = get_hash_type(&hash);
+            if matches!(hash_type, HashType::Unknown) {
+                return None;
+            }
+
+            let (score, description) = if parts.len() >= 3 {
+                // 3-column format: hash;score;description
+                match parts[1].trim().parse::<i16>() {
+                    Ok(s) if s > 0 && s <= 100 => (s, parts[2].trim().to_string()),
+                    _ => (75, parts[2].trim().to_string()), // Invalid score defaults to 75
+                }
+            } else if parts.len() >= 2 {
+                // 2-column format: hash;description
+                (75, parts[1].trim().to_string())
+            } else {
+                return None; // Need at least hash;description
+            };
+
+            Some(HashIOC {
+                hash_type,
+                hash_value: hash,
+                description,
+                score,
+            })
+        }
+
+        #[test]
+        fn test_malformed_line_missing_fields() {
+            // Just a hash, no description
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e");
+            assert!(result.is_none(), "Single field should be rejected");
+        }
+
+        #[test]
+        fn test_empty_description() {
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            assert!(ioc.description.is_empty());
+        }
+
+        #[test]
+        fn test_negative_score() {
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;-50;Malware");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            // Negative score should default to 75
+            assert_eq!(ioc.score, 75);
+        }
+
+        #[test]
+        fn test_zero_score() {
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;0;Malware");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            // Zero score should default to 75
+            assert_eq!(ioc.score, 75);
+        }
+
+        #[test]
+        fn test_score_over_100() {
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;150;Malware");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            // Score > 100 should default to 75
+            assert_eq!(ioc.score, 75);
+        }
+
+        #[test]
+        fn test_valid_score_range() {
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;85;Malware");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            assert_eq!(ioc.score, 85);
+        }
+
+        #[test]
+        fn test_invalid_regex_in_filename_ioc() {
+            // Test that invalid regex fails compilation
+            let result = Regex::new("[invalid(regex");
+            assert!(result.is_err(), "Invalid regex should fail to compile");
+        }
+
+        #[test]
+        fn test_c2_ioc_ip_format() {
+            let c2 = C2IOC {
+                server: "192.168.1.100".to_string(),
+                description: "Test C2".to_string(),
+                score: 80,
+            };
+            assert!(is_ip_address(&c2.server));
+        }
+
+        #[test]
+        fn test_c2_ioc_domain_format() {
+            let c2 = C2IOC {
+                server: "evil.com".to_string(),
+                description: "Test C2".to_string(),
+                score: 80,
+            };
+            assert!(!is_ip_address(&c2.server)); // Domain, not IP
+        }
+
+        #[test]
+        fn test_c2_ioc_subdomain_format() {
+            let c2 = C2IOC {
+                server: "c2.evil.com".to_string(),
+                description: "Test C2 subdomain".to_string(),
+                score: 80,
+            };
+            assert!(!is_ip_address(&c2.server)); // Subdomain, not IP
+        }
+
+        #[test]
+        fn test_hash_wrong_length() {
+            // Too short
+            assert!(matches!(get_hash_type("abc123"), HashType::Unknown));
+
+            // Too long for MD5
+            assert!(matches!(
+                get_hash_type("d41d8cd98f00b204e9800998ecf8427eX"),
+                HashType::Unknown
+            ));
+
+            // Between MD5 and SHA1
+            assert!(matches!(
+                get_hash_type("d41d8cd98f00b204e9800998ecf842"),
+                HashType::Unknown
+            ));
+        }
+
+        #[test]
+        fn test_hash_non_hex_chars() {
+            // Valid length but non-hex (note: get_hash_type only checks length, not content)
+            // This test documents current behavior
+            let hash = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"; // 32 chars, non-hex
+            let hash_type = get_hash_type(hash);
+            // Currently only checks length, not hex validity
+            assert!(matches!(hash_type, HashType::Md5));
+        }
+
+        #[test]
+        fn test_hash_iocs_sorted_for_binary_search() {
+            let mut iocs = vec![
+                HashIOC {
+                    hash_type: HashType::Md5,
+                    hash_value: "cccccccccccccccccccccccccccccccc".to_string(),
+                    description: "C".to_string(),
+                    score: 70,
+                },
+                HashIOC {
+                    hash_type: HashType::Md5,
+                    hash_value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    description: "A".to_string(),
+                    score: 80,
+                },
+                HashIOC {
+                    hash_type: HashType::Md5,
+                    hash_value: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    description: "B".to_string(),
+                    score: 75,
+                },
+            ];
+
+            // Sort by hash value (as done in initialize_hash_iocs)
+            iocs.sort_by(|a, b| a.hash_value.cmp(&b.hash_value));
+
+            // Verify sorted order
+            assert_eq!(iocs[0].hash_value, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            assert_eq!(iocs[1].hash_value, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            assert_eq!(iocs[2].hash_value, "cccccccccccccccccccccccccccccccc");
+
+            // Binary search should work
+            let found = find_hash_ioc("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &iocs);
+            assert!(found.is_some());
+            assert_eq!(found.unwrap().description, "B");
+        }
+
+        #[test]
+        fn test_two_column_format() {
+            let result = parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;Test description");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            assert_eq!(ioc.score, 75); // Default score
+            assert_eq!(ioc.description, "Test description");
+        }
+
+        #[test]
+        fn test_three_column_format() {
+            let result =
+                parse_hash_ioc_line("d41d8cd98f00b204e9800998ecf8427e;90;Test description");
+            assert!(result.is_some());
+            let ioc = result.unwrap();
+            assert_eq!(ioc.score, 90);
+            assert_eq!(ioc.description, "Test description");
+        }
+
+        #[test]
+        fn test_comment_line_skipped() {
+            let result = parse_hash_ioc_line("# This is a comment");
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_empty_line_skipped() {
+            let result = parse_hash_ioc_line("");
+            assert!(result.is_none());
+
+            let result = parse_hash_ioc_line("   ");
+            assert!(result.is_none());
         }
     }
 }

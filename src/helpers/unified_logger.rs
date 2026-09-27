@@ -908,16 +908,41 @@ impl UnifiedLogger {
             context_map.insert(k.to_string(), v.to_string());
         }
 
+        self.error_with_target(msg, context_map, None, None, None);
+    }
+
+    pub fn file_error(&self, msg: &str, path: &str) {
+        self.error_with_target(msg, BTreeMap::new(), Some(path.to_string()), None, None);
+    }
+
+    pub fn process_error(&self, msg: &str, pid: u32, process_name: &str) {
+        self.error_with_target(
+            msg,
+            BTreeMap::new(),
+            None,
+            Some(pid),
+            Some(process_name.to_string()),
+        );
+    }
+
+    fn error_with_target(
+        &self,
+        msg: &str,
+        context: BTreeMap<String, String>,
+        file_path: Option<String>,
+        pid: Option<u32>,
+        process_name: Option<String>,
+    ) {
         self.log(LogEvent {
             timestamp: Utc::now(),
             level: LogLevel::Error,
             event_type: EventType::Error,
             hostname: self.hostname.clone(),
             message: msg.to_string(),
-            context: context_map,
-            file_path: None,
-            pid: None,
-            process_name: None,
+            context,
+            file_path,
+            pid,
+            process_name,
             score: None,
             file_type: None,
             file_size: None,
@@ -1109,5 +1134,558 @@ impl UnifiedLogger {
             file_modified: None,
             file_accessed: None,
         });
+    }
+}
+
+// =========================================================================
+// Test Module 2: SIEM Integration Tests
+// Tests RemoteOutput::format_event() for syslog and JSON formats
+// =========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Create a test LogEvent with configurable parameters
+    fn create_test_event(level: LogLevel, message: &str) -> LogEvent {
+        let mut context = BTreeMap::new();
+        context.insert("test_key".to_string(), "test_value".to_string());
+
+        LogEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            level,
+            event_type: EventType::Info,
+            hostname: "test-host".to_string(),
+            message: message.to_string(),
+            context,
+            file_path: None,
+            pid: None,
+            process_name: None,
+            score: None,
+            file_type: None,
+            file_size: None,
+            md5: None,
+            sha1: None,
+            sha256: None,
+            file_created: None,
+            file_modified: None,
+            file_accessed: None,
+            start_time: None,
+            run_time: None,
+            memory_bytes: None,
+            cpu_usage: None,
+            connection_count: None,
+            listening_ports: None,
+            reasons: None,
+        }
+    }
+
+    // --- Syslog Format Tests ---
+
+    mod syslog_format_tests {
+        use super::*;
+
+        fn create_remote_output_syslog() -> RemoteOutput {
+            // Create a RemoteOutput configured for syslog format
+            // Note: We can't actually connect, but we can test format_event
+            RemoteOutput {
+                host: "127.0.0.1".to_string(),
+                port: 514,
+                protocol: RemoteProtocol::Udp,
+                format: RemoteFormat::Syslog,
+                udp_socket: None,
+                tcp_stream: std::sync::Mutex::new(None),
+            }
+        }
+
+        #[test]
+        fn test_syslog_format_structure() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Warning, "Test warning message");
+
+            let formatted = output.format_event(&event);
+
+            // Should start with <PRI>
+            assert!(formatted.starts_with('<'), "Syslog should start with <PRI>");
+
+            // Should contain hostname
+            assert!(formatted.contains("test-host"), "Should contain hostname");
+
+            // Should contain Loki-RS identifier
+            assert!(
+                formatted.contains("Loki-RS:"),
+                "Should contain Loki-RS identifier"
+            );
+
+            // Should contain the message
+            assert!(
+                formatted.contains("Test warning message"),
+                "Should contain message"
+            );
+        }
+
+        #[test]
+        fn test_syslog_severity_mapping_alert() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Alert, "Alert message");
+
+            let formatted = output.format_event(&event);
+
+            // Alert = severity 1, facility 1 → PRI = 1*8 + 1 = 9
+            assert!(formatted.starts_with("<9>"), "Alert should have PRI=9");
+        }
+
+        #[test]
+        fn test_syslog_severity_mapping_error() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Error, "Error message");
+
+            let formatted = output.format_event(&event);
+
+            // Error = severity 3, facility 1 → PRI = 1*8 + 3 = 11
+            assert!(formatted.starts_with("<11>"), "Error should have PRI=11");
+        }
+
+        #[test]
+        fn test_syslog_severity_mapping_warning() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Warning, "Warning message");
+
+            let formatted = output.format_event(&event);
+
+            // Warning = severity 4, facility 1 → PRI = 1*8 + 4 = 12
+            assert!(formatted.starts_with("<12>"), "Warning should have PRI=12");
+        }
+
+        #[test]
+        fn test_syslog_severity_mapping_notice() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Notice, "Notice message");
+
+            let formatted = output.format_event(&event);
+
+            // Notice = severity 5, facility 1 → PRI = 1*8 + 5 = 13
+            assert!(formatted.starts_with("<13>"), "Notice should have PRI=13");
+        }
+
+        #[test]
+        fn test_syslog_severity_mapping_info() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Info, "Info message");
+
+            let formatted = output.format_event(&event);
+
+            // Info = severity 6, facility 1 → PRI = 1*8 + 6 = 14
+            assert!(formatted.starts_with("<14>"), "Info should have PRI=14");
+        }
+
+        #[test]
+        fn test_syslog_severity_mapping_debug() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Debug, "Debug message");
+
+            let formatted = output.format_event(&event);
+
+            // Debug = severity 7, facility 1 → PRI = 1*8 + 7 = 15
+            assert!(formatted.starts_with("<15>"), "Debug should have PRI=15");
+        }
+
+        #[test]
+        fn test_syslog_pri_calculation() {
+            // Verify PRI = facility * 8 + severity
+            // Using facility = 1 (user-level)
+            let facility = 1;
+
+            let test_cases = vec![
+                (LogLevel::Alert, 1, facility * 8 + 1),
+                (LogLevel::Error, 3, facility * 8 + 3),
+                (LogLevel::Warning, 4, facility * 8 + 4),
+                (LogLevel::Notice, 5, facility * 8 + 5),
+                (LogLevel::Info, 6, facility * 8 + 6),
+                (LogLevel::Debug, 7, facility * 8 + 7),
+            ];
+
+            let output = create_remote_output_syslog();
+
+            for (level, severity, expected_pri) in test_cases {
+                let event = create_test_event(level, "test");
+                let formatted = output.format_event(&event);
+
+                let expected_start = format!("<{}>", expected_pri);
+                assert!(
+                    formatted.starts_with(&expected_start),
+                    "Level {:?} (severity {}) should have PRI={}, got: {}",
+                    level,
+                    severity,
+                    expected_pri,
+                    &formatted[..20.min(formatted.len())]
+                );
+            }
+        }
+
+        #[test]
+        fn test_syslog_context_appended() {
+            let output = create_remote_output_syslog();
+            let event = create_test_event(LogLevel::Info, "Test message");
+
+            let formatted = output.format_event(&event);
+
+            // Context should be appended as key=value pairs
+            assert!(
+                formatted.contains("test_key=test_value"),
+                "Context should be appended in syslog: {}",
+                formatted
+            );
+        }
+
+        #[test]
+        fn test_syslog_newlines_replaced() {
+            let output = create_remote_output_syslog();
+            let mut event = create_test_event(LogLevel::Info, "Line1\nLine2\nLine3");
+            event.context.clear();
+
+            let formatted = output.format_event(&event);
+
+            // Newlines should be replaced with spaces
+            assert!(
+                !formatted.contains('\n'),
+                "Newlines should be replaced in syslog: {}",
+                formatted
+            );
+            assert!(
+                formatted.contains("Line1 Line2 Line3"),
+                "Message should be on single line: {}",
+                formatted
+            );
+        }
+    }
+
+    // --- JSON Format Tests ---
+
+    mod json_format_tests {
+        use super::*;
+
+        fn create_remote_output_json() -> RemoteOutput {
+            RemoteOutput {
+                host: "127.0.0.1".to_string(),
+                port: 514,
+                protocol: RemoteProtocol::Udp,
+                format: RemoteFormat::Json,
+                udp_socket: None,
+                tcp_stream: std::sync::Mutex::new(None),
+            }
+        }
+
+        #[test]
+        fn test_json_format_valid() {
+            let output = create_remote_output_json();
+            let event = create_test_event(LogLevel::Warning, "Test message");
+
+            let formatted = output.format_event(&event);
+
+            // Should be valid JSON
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&formatted);
+            assert!(parsed.is_ok(), "Should produce valid JSON: {}", formatted);
+        }
+
+        #[test]
+        fn test_json_contains_all_fields() {
+            let output = create_remote_output_json();
+            let event = create_test_event(LogLevel::Warning, "Test message");
+
+            let formatted = output.format_event(&event);
+            let parsed: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+
+            // Check required fields
+            assert!(parsed.get("timestamp").is_some(), "Should have timestamp");
+            assert!(parsed.get("level").is_some(), "Should have level");
+            assert!(parsed.get("event_type").is_some(), "Should have event_type");
+            assert!(parsed.get("hostname").is_some(), "Should have hostname");
+            assert!(parsed.get("message").is_some(), "Should have message");
+        }
+
+        #[test]
+        fn test_json_level_values() {
+            let output = create_remote_output_json();
+
+            let test_cases = vec![
+                (LogLevel::Alert, "ALERT"),
+                (LogLevel::Error, "ERROR"),
+                (LogLevel::Warning, "WARNING"),
+                (LogLevel::Notice, "NOTICE"),
+                (LogLevel::Info, "INFO"),
+                (LogLevel::Debug, "DEBUG"),
+            ];
+
+            for (level, expected_str) in test_cases {
+                let event = create_test_event(level, "test");
+                let formatted = output.format_event(&event);
+                let parsed: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+
+                assert_eq!(
+                    parsed.get("level").unwrap().as_str().unwrap(),
+                    expected_str,
+                    "Level {:?} should serialize to '{}'",
+                    level,
+                    expected_str
+                );
+            }
+        }
+
+        #[test]
+        fn test_json_ansi_stripped() {
+            let output = create_remote_output_json();
+            let event = create_test_event(LogLevel::Info, "\x1b[31mRed text\x1b[0m");
+
+            let formatted = output.format_event(&event);
+
+            // ANSI codes should be stripped
+            assert!(!formatted.contains("\x1b"), "ANSI codes should be stripped");
+            assert!(
+                formatted.contains("Red text"),
+                "Message content should remain"
+            );
+        }
+
+        #[test]
+        fn test_json_context_included() {
+            let output = create_remote_output_json();
+            let event = create_test_event(LogLevel::Info, "Test message");
+
+            let formatted = output.format_event(&event);
+            let parsed: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+
+            let context = parsed.get("context").unwrap();
+            assert_eq!(
+                context.get("test_key").unwrap().as_str().unwrap(),
+                "test_value"
+            );
+        }
+    }
+
+    // --- Multi-Sink Routing Tests ---
+
+    mod multi_sink_tests {
+        use super::*;
+        use std::sync::Arc;
+
+        /// A test LogOutput implementation that collects events
+        struct CollectingOutput {
+            events: std::sync::Mutex<Vec<LogEvent>>,
+            write_count: AtomicUsize,
+        }
+
+        impl CollectingOutput {
+            fn new() -> Self {
+                Self {
+                    events: std::sync::Mutex::new(Vec::new()),
+                    write_count: AtomicUsize::new(0),
+                }
+            }
+
+            fn event_count(&self) -> usize {
+                self.events.lock().unwrap().len()
+            }
+
+            fn get_events(&self) -> Vec<LogEvent> {
+                self.events.lock().unwrap().clone()
+            }
+        }
+
+        impl LogOutput for CollectingOutput {
+            fn write(&self, event: &LogEvent) -> Result<(), std::io::Error> {
+                self.events.lock().unwrap().push(event.clone());
+                self.write_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        /// Wrapper to make CollectingOutput work with UnifiedLogger
+        struct TestableLogger {
+            outputs: Vec<Arc<CollectingOutput>>,
+            hostname: String,
+            log_level: LogLevel,
+        }
+
+        impl TestableLogger {
+            fn new(num_sinks: usize, log_level: LogLevel) -> Self {
+                let outputs: Vec<Arc<CollectingOutput>> = (0..num_sinks)
+                    .map(|_| Arc::new(CollectingOutput::new()))
+                    .collect();
+
+                Self {
+                    outputs,
+                    hostname: "test-host".to_string(),
+                    log_level,
+                }
+            }
+
+            fn log(&self, mut event: LogEvent) {
+                if event.level > self.log_level {
+                    return;
+                }
+
+                if event.hostname.is_empty() {
+                    event.hostname = self.hostname.clone();
+                }
+
+                for output in &self.outputs {
+                    let _ = output.write(&event);
+                }
+            }
+
+            fn get_sink_event_counts(&self) -> Vec<usize> {
+                self.outputs.iter().map(|o| o.event_count()).collect()
+            }
+        }
+
+        #[test]
+        fn test_event_routed_to_all_sinks() {
+            let logger = TestableLogger::new(3, LogLevel::Debug);
+
+            let event = create_test_event(LogLevel::Warning, "Test message");
+            logger.log(event);
+
+            let counts = logger.get_sink_event_counts();
+
+            // All 3 sinks should receive the event
+            assert_eq!(counts, vec![1, 1, 1], "All sinks should receive the event");
+        }
+
+        #[test]
+        fn test_multiple_events_routed_to_all_sinks() {
+            let logger = TestableLogger::new(2, LogLevel::Debug);
+
+            // Log 5 events
+            for i in 0..5 {
+                let event = create_test_event(LogLevel::Info, &format!("Message {}", i));
+                logger.log(event);
+            }
+
+            let counts = logger.get_sink_event_counts();
+
+            // Both sinks should receive all 5 events
+            assert_eq!(counts, vec![5, 5], "Both sinks should receive all events");
+        }
+
+        #[test]
+        fn test_filtered_events_not_routed() {
+            let logger = TestableLogger::new(2, LogLevel::Warning);
+
+            // Log events at different levels
+            logger.log(create_test_event(LogLevel::Alert, "Alert")); // Should pass
+            logger.log(create_test_event(LogLevel::Warning, "Warn")); // Should pass
+            logger.log(create_test_event(LogLevel::Notice, "Notice")); // Should be filtered
+            logger.log(create_test_event(LogLevel::Info, "Info")); // Should be filtered
+            logger.log(create_test_event(LogLevel::Debug, "Debug")); // Should be filtered
+
+            let counts = logger.get_sink_event_counts();
+
+            // Only 2 events should pass (Alert and Warning)
+            assert_eq!(counts, vec![2, 2], "Only Warning+ events should pass");
+        }
+
+        #[test]
+        fn test_event_content_same_across_sinks() {
+            let logger = TestableLogger::new(2, LogLevel::Debug);
+
+            let event = create_test_event(LogLevel::Info, "Same content test");
+            logger.log(event);
+
+            let sink1_events = logger.outputs[0].get_events();
+            let sink2_events = logger.outputs[1].get_events();
+
+            assert_eq!(sink1_events.len(), 1);
+            assert_eq!(sink2_events.len(), 1);
+
+            // Both should have same message
+            assert_eq!(sink1_events[0].message, sink2_events[0].message);
+            assert_eq!(sink1_events[0].message, "Same content test");
+        }
+    }
+
+    // --- ANSI Stripping Tests ---
+
+    mod ansi_strip_tests {
+        use super::*;
+
+        #[test]
+        fn test_strip_basic_colors() {
+            let input = "\x1b[31mRed\x1b[0m \x1b[32mGreen\x1b[0m";
+            let output = strip_ansi(input);
+            assert_eq!(output, "Red Green");
+        }
+
+        #[test]
+        fn test_strip_bold_and_underline() {
+            let input = "\x1b[1mBold\x1b[0m \x1b[4mUnderline\x1b[0m";
+            let output = strip_ansi(input);
+            assert_eq!(output, "Bold Underline");
+        }
+
+        #[test]
+        fn test_strip_256_colors() {
+            let input = "\x1b[38;5;196mBright Red\x1b[0m";
+            let output = strip_ansi(input);
+            assert_eq!(output, "Bright Red");
+        }
+
+        #[test]
+        fn test_no_ansi_unchanged() {
+            let input = "Plain text without ANSI";
+            let output = strip_ansi(input);
+            assert_eq!(output, input);
+        }
+
+        #[test]
+        fn test_empty_string() {
+            let input = "";
+            let output = strip_ansi(input);
+            assert_eq!(output, "");
+        }
+
+        #[test]
+        fn test_mixed_content() {
+            let input = "Start \x1b[31mcolored\x1b[0m middle \x1b[32mmore\x1b[0m end";
+            let output = strip_ansi(input);
+            assert_eq!(output, "Start colored middle more end");
+        }
+    }
+
+    // --- LogLevel Tests ---
+
+    mod log_level_tests {
+        use super::*;
+
+        #[test]
+        fn test_log_level_display() {
+            assert_eq!(format!("{}", LogLevel::Alert), "ALERT");
+            assert_eq!(format!("{}", LogLevel::Warning), "WARNING");
+            assert_eq!(format!("{}", LogLevel::Notice), "NOTICE");
+            assert_eq!(format!("{}", LogLevel::Info), "INFO");
+            assert_eq!(format!("{}", LogLevel::Error), "ERROR");
+            assert_eq!(format!("{}", LogLevel::Debug), "DEBUG");
+        }
+
+        #[test]
+        fn test_log_level_ordering() {
+            // Verify enum ordering (Alert is highest priority = smallest value)
+            assert!(LogLevel::Alert < LogLevel::Error);
+            assert!(LogLevel::Error < LogLevel::Warning);
+            assert!(LogLevel::Warning < LogLevel::Notice);
+            assert!(LogLevel::Notice < LogLevel::Info);
+            assert!(LogLevel::Info < LogLevel::Debug);
+        }
+
+        #[test]
+        fn test_log_level_serialization() {
+            let json = serde_json::to_string(&LogLevel::Alert).unwrap();
+            assert_eq!(json, "\"ALERT\"");
+
+            let json = serde_json::to_string(&LogLevel::Warning).unwrap();
+            assert_eq!(json, "\"WARNING\"");
+        }
     }
 }

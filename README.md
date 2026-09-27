@@ -48,7 +48,7 @@ Signatures ship with the release but get stale quickly. Run `loki-util update` t
 
 ## Signatures
 
-Loki-RS uses [YARA Forge](https://yaraforge.com/) as its default signature source. Loki-RS ships and updates with the **Core** rule set (high accuracy, low false positives, optimized for performance). If you need broader coverage, you can swap in the Extended or Full sets from YARA Forge.
+Loki-RS uses [YARA Forge](https://yarahq.github.io/) as its default signature source. Loki-RS ships and updates with the **Core** rule set (high accuracy, low false positives, optimized for performance). If you need broader coverage, you can swap in the Extended or Full sets from YARA Forge.
 
 IOC files in `signatures/iocs/` remain supported as optional local/custom content.
 
@@ -121,7 +121,7 @@ sudo ./loki --remote syslog-host.internal:514 --remote-proto udp
 | `--notice-level <SCORE>` | `40` | Score threshold for NOTICE |
 | `--max-reasons <NUM>` | `2` | Max match reasons to display per finding |
 | `-m, --max-file-size <BYTES>` | `64000000` | Maximum file size to scan (64MB) |
-| `--yara-timeout <SECONDS>` | `10` | YARA scan timeout per file/process |
+| `--yara-timeout <SECONDS>` | `10` | Maximum YARA scan time for each file or process-memory buffer (minimum: 1 second) |
 | `-c, --cpu-limit <PERCENT>` | `100` | CPU utilization limit (1-100) |
 | `--threads <NUM>` | `-2` | Number of threads (0=all, -1=all-1, -2=all-2) |
 
